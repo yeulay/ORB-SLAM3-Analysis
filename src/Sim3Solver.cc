@@ -32,6 +32,18 @@ namespace ORB_SLAM3
 {
 
 
+// ============================================================================
+// Sim3Solver —— Horn 闭式法求两关键帧间相似变换 Sim(3)=(尺度 s, 旋转 R, 平移 t),RANSAC 鲁棒化
+// 用途:回环/地图合并时,由两帧匹配的 3D 地图点对解出 KF2→KF1 的 (sR,t)。★单目需估尺度 s(mbFixScale=false),
+//   双目/RGBD 尺度已知则固定 s=1(mbFixScale=true)。解出的 Sim3 作回环约束喂给本质图优化 OptimizeSim3/EssentialGraph。
+// 流程:构造时把匹配点对转到各自相机系 3D(mvX3Dc1/2)→ iterate 跑 RANSAC:每轮取 3 对点 ComputeSim3
+//   (Horn 闭式)→ CheckInliers(双向重投影卡方)→ 留最优。Horn 1987: Closed-form solution of absolute orientation。
+// ============================================================================
+/**
+ * @brief 构造:从两 KF 的匹配地图点对建立 Sim3 求解所需数据(各自相机系 3D + 图像投影 + 误差阈值)
+ * @details 遍历匹配 vpMatched12 过滤坏点;把 KF1/KF2 地图点世界坐标转到各自相机系存 mvX3Dc1/mvX3Dc2;
+ *   记录卡方阈值(9.21×σ²,自由度 2 的 99%)。bFixScale 决定是否固定尺度。
+ */
 Sim3Solver::Sim3Solver(KeyFrame *pKF1, KeyFrame *pKF2, const vector<MapPoint *> &vpMatched12, const bool bFixScale,
                        vector<KeyFrame*> vpKeyFrameMatchedMP):
     mnIterations(0), mnBestInliers(0), mbFixScale(bFixScale),
@@ -120,6 +132,7 @@ Sim3Solver::Sim3Solver(KeyFrame *pKF1, KeyFrame *pKF2, const vector<MapPoint *> 
     SetRansacParameters();
 }
 
+/// @brief 据期望成功概率/最小内点数/对应点总数,推算 RANSAC 最大迭代次数(每次抽样 3 对点)
 void Sim3Solver::SetRansacParameters(double probability, int minInliers, int maxIterations)
 {
     mRansacProb = probability;
@@ -146,6 +159,11 @@ void Sim3Solver::SetRansacParameters(double probability, int minInliers, int max
     mnIterations = 0;
 }
 
+/**
+ * @brief RANSAC 主循环:反复抽 3 对点算 Sim3 + 统计内点,返回内点最多的 Sim3(T12)
+ * @details 每轮随机取 3 对对应点 → ComputeSim3(Horn 闭式)→ CheckInliers;内点超过阈值即提前返回成功。
+ *   (另有带 bConverge 的重载,语义相同,多回报是否收敛。)
+ */
 Eigen::Matrix4f Sim3Solver::iterate(int nIterations, bool &bNoMore, vector<bool> &vbInliers, int &nInliers)
 {
     bNoMore = false;
@@ -308,6 +326,12 @@ void Sim3Solver::ComputeCentroid(Eigen::Matrix3f &P, Eigen::Matrix3f &Pr, Eigen:
 }
 
 
+/**
+ * @brief ★Horn 1987 闭式法:由 3+ 对 3D 点求相似变换 (s,R,t),使 P1 ≈ s·R·P2 + t
+ * @details 8 步:① 各点集去质心(ComputeCentroid)② M = Pr2·Pr1ᵀ ③ 由 M 构造 4×4 对称阵 N
+ *   ④ N 的最大特征值对应特征向量 = 最优旋转四元数 → mR12i ⑤ 旋转 set2 ⑥ 尺度 s = Σ(Pr1·P3)/Σ(P3·P3)
+ *   (mbFixScale 时 s=1)⑦ 平移 t = O1 − s·R·O2 ⑧ 组装 T12 及其逆 T21。闭式解、无需迭代优化。
+ */
 void Sim3Solver::ComputeSim3(Eigen::Matrix3f &P1, Eigen::Matrix3f &P2)
 {
     // Custom implementation of:
@@ -412,6 +436,7 @@ void Sim3Solver::ComputeSim3(Eigen::Matrix3f &P1, Eigen::Matrix3f &P2)
 }
 
 
+/// @brief 双向重投影检验内点:用 T12/T21 把点投到对方图像,两向重投影误差均小于卡方阈值即判内点
 void Sim3Solver::CheckInliers()
 {
     vector<Eigen::Vector2f> vP1im2, vP2im1;
