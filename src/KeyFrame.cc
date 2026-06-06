@@ -42,6 +42,17 @@ KeyFrame::KeyFrame():
 
 }
 
+// ============================================================================
+// KeyFrame —— 关键帧,ORB-SLAM3 三大数据结构的"图节点"(由普通 Frame 选拔晋升而来,永久驻留地图)
+// 三类图关系(本类核心):
+//   ① 共视图 Covisibility:mConnectedKeyFrameWeights(KF→共视地图点数)+ 按权排序 mvpOrderedConnectedKeyFrames,
+//      UpdateConnections 据共享 MapPoint 自动构建——LocalBA 的"局部窗口"即来自此(对应 VINS 硬编码滑窗 10 帧)
+//   ② 生成树 Spanning Tree:mpParent + mspChildrens(首次连接认最高共视者为父),回环本质图优化的骨架
+//   ③ 回环/合并边:mspLoopEdges / mspMergeEdges(AddLoopEdge 置 mbNotErase 保护本帧不被剔除)
+// 位姿:mTcw + 缓存派生 mRcw/mTwc/mRwc/mOwb;观测:mvpMapPoints(按特征点索引存匹配的 MapPoint)。
+// IMU:mImuBias/mVw/mpImuPreintegrated + mPrevKF/mNextKF(时序预积分链)。线程安全:mMutexPose/Connections/Features。
+// 本构造:把一帧 Frame "晋升"为 KeyFrame(拷贝特征/网格/位姿/IMU 预积分等),分配全局 mnId。
+// ============================================================================
 KeyFrame::KeyFrame(Frame &F, Map *pMap, KeyFrameDatabase *pKFDB):
     bImu(pMap->isImuInitialized()), mnFrameId(F.mnId),  mTimeStamp(F.mTimeStamp), mnGridCols(FRAME_GRID_COLS), mnGridRows(FRAME_GRID_ROWS),
     mfGridElementWidthInv(F.mfGridElementWidthInv), mfGridElementHeightInv(F.mfGridElementHeightInv),
@@ -95,6 +106,7 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap, KeyFrameDatabase *pKFDB):
     mnOriginMapId = pMap->GetId();
 }
 
+/// @brief 计算词袋向量 mBowVec + 特征向量 mFeatVec(DBoW2,取词汇树第 4 层节点),供回环/重定位检索与加速匹配
 void KeyFrame::ComputeBoW()
 {
     if(mBowVec.empty() || mFeatVec.empty())
@@ -106,6 +118,11 @@ void KeyFrame::ComputeBoW()
     }
 }
 
+/**
+ * @brief 设置相机位姿 Tcw 并同步缓存派生量(Rcw / Twc / Rwc / IMU 位置 Owb)
+ * @details mTcw 是"世界→相机"变换;一次性算好逆 mTwc、旋转 mRcw/mRwc 供高频读取(避免每次求逆)。
+ *   有 IMU 标定时同时更新 IMU(body)在世界系的位置 mOwb。(对应 docs 所述位姿"写一次、缓存多份"思想。)
+ */
 void KeyFrame::SetPose(const Sophus::SE3f &Tcw)
 {
     unique_lock<mutex> lock(mMutexPose);
@@ -186,6 +203,7 @@ bool KeyFrame::isVelocitySet()
     return mbHasVelocity;
 }
 
+/// @brief 在共视图中增/改一条到 pKF 的边(权 = 共视地图点数),随后 UpdateBestCovisibles 重排
 void KeyFrame::AddConnection(KeyFrame *pKF, const int &weight)
 {
     {
@@ -201,6 +219,7 @@ void KeyFrame::AddConnection(KeyFrame *pKF, const int &weight)
     UpdateBestCovisibles();
 }
 
+/// @brief 把共视边按权重降序排成 mvpOrderedConnectedKeyFrames/mvOrderedWeights(剔坏 KF),供"取前 N 共视帧"等查询
 void KeyFrame::UpdateBestCovisibles()
 {
     unique_lock<mutex> lock(mMutexConnections);
@@ -234,6 +253,8 @@ set<KeyFrame*> KeyFrame::GetConnectedKeyFrames()
     return s;
 }
 
+// ↓↓ 共视图查询:GetVectorCovisibleKeyFrames(全部按权排序)/ GetBestCovisibilityKeyFrames(前 N)/
+//    GetCovisiblesByWeight(权 ≥ w)——LocalBA、回环检测、参考帧选择都靠这些取"邻域关键帧" ↓↓
 vector<KeyFrame*> KeyFrame::GetVectorCovisibleKeyFrames()
 {
     unique_lock<mutex> lock(mMutexConnections);
@@ -294,6 +315,7 @@ int KeyFrame::GetNumberMPs()
     return numberMPs;
 }
 
+// ↓↓ 关键帧 ↔ 地图点匹配:mvpMapPoints[特征点索引] = 对应 MapPoint(无则 NULL);与 MapPoint::AddObservation 互为双向 ↓↓
 void KeyFrame::AddMapPoint(MapPoint *pMP, const size_t &idx)
 {
     unique_lock<mutex> lock(mMutexFeatures);
@@ -376,6 +398,12 @@ MapPoint* KeyFrame::GetMapPoint(const size_t &idx)
     return mvpMapPoints[idx];
 }
 
+/**
+ * @brief 据本帧地图点的共享情况重建共视图,并在首次连接时确定生成树父节点
+ * @details 统计每个 MapPoint 还被哪些 KF 观测 → KFcounter(共视计数);计数 ≥ 阈值 15 的建双向共视边
+ *   (一个都不够则取最大者);按权排序写入 mConnectedKeyFrameWeights / mvpOrderedConnectedKeyFrames。
+ *   ★mbFirstConnection 时认"最高共视者"为父 mpParent 并 AddChild,构建生成树。LocalMapping 每来新 KF 必调。
+ */
 void KeyFrame::UpdateConnections(bool upParent)
 {
     map<KeyFrame*,int> KFcounter;
@@ -473,6 +501,8 @@ void KeyFrame::UpdateConnections(bool upParent)
     }
 }
 
+// ↓↓ 生成树维护:父 mpParent + 子 mspChildrens。生成树是回环本质图优化(OptimizeEssentialGraph)的骨架,
+//    保证即使共视边稀疏也有一条连通全图的最小树。ChangeParent 改父并互相登记 ↓↓
 void KeyFrame::AddChild(KeyFrame *pKF)
 {
     unique_lock<mutex> lockCon(mMutexConnections);
@@ -522,6 +552,10 @@ void KeyFrame::SetFirstConnection(bool bFirst)
     mbFirstConnection=bFirst;
 }
 
+/**
+ * @brief 登记一条回环边到 pKF,并置 mbNotErase(★带回环边的关键帧禁止被 KeyFrameCulling 删除)
+ * @details 回环边是本质图优化的强约束;删其端点会破坏回环一致性,故用 mbNotErase 保护。
+ */
 void KeyFrame::AddLoopEdge(KeyFrame *pKF)
 {
     unique_lock<mutex> lockCon(mMutexConnections);
@@ -554,6 +588,10 @@ void KeyFrame::SetNotErase()
     mbNotErase = true;
 }
 
+/**
+ * @brief 解除删除保护:无回环边则清 mbNotErase;若期间曾被请求删除(mbToBeErased)则此刻真正 SetBadFlag
+ * @details 与 SetNotErase 配对——LoopClosing 处理某 KF 期间先 SetNotErase 保护,处理完 SetErase 释放。
+ */
 void KeyFrame::SetErase()
 {
     {
@@ -570,6 +608,14 @@ void KeyFrame::SetErase()
     }
 }
 
+/**
+ * @brief 剔除本关键帧并修复生成树(KeyFrameCulling 删冗余帧时调用)
+ * @details 初始 KF 不删;mbNotErase(有回环边/正被处理)则仅标 mbToBeErased 延后。否则:
+ *   ① 通知所有共视 KF 擦除到本帧的连接、通知所有 MapPoint 擦除本帧观测;
+ *   ② ★生成树修复:本帧每个子节点要重新认父——在"父候选集"(初始=本帧之父)里挑与子共视权最高者改父,
+ *      被改父的子再加入候选集(迭代);找不到共视父的子退而认本帧之父。避免删帧后生成树断裂。
+ *   ③ 记录 mTcp(本帧相对父位姿),置 mbBad,从地图与 KeyFrameDatabase 删除。
+ */
 void KeyFrame::SetBadFlag()
 {
     {
@@ -701,6 +747,10 @@ void KeyFrame::EraseConnection(KeyFrame* pKF)
 }
 
 
+/**
+ * @brief 取以 (x,y) 为中心、半径 r 内的特征点索引(借网格 mGrid 加速,bRight 查右目)
+ * @details 投影匹配/重投影搜索时只在候选区域找,避免全图遍历:先定位覆盖的网格单元,再逐点做距离判定。
+ */
 vector<size_t> KeyFrame::GetFeaturesInArea(const float &x, const float &y, const float &r, const bool bRight) const
 {
     vector<size_t> vIndices;
@@ -752,6 +802,7 @@ bool KeyFrame::IsInImage(const float &x, const float &y) const
     return (x>=mnMinX && x<mnMaxX && y>=mnMinY && y<mnMaxY);
 }
 
+/// @brief 把第 i 个特征点用其深度 mvDepth[i] 反投影成世界系 3D 点(双目/RGBD 有深度时,用于新建地图点)
 bool KeyFrame::UnprojectStereo(int i, Eigen::Vector3f &x3D)
 {
     const float z = mvDepth[i];
@@ -771,6 +822,7 @@ bool KeyFrame::UnprojectStereo(int i, Eigen::Vector3f &x3D)
         return false;
 }
 
+/// @brief 计算本帧观测地图点深度的 1/q 分位(q=2 即中位深度);单目初始化时用它归一化地图尺度
 float KeyFrame::ComputeSceneMedianDepth(const int q)
 {
     if(N==0)
@@ -806,6 +858,7 @@ float KeyFrame::ComputeSceneMedianDepth(const int q)
     return vDepths[(vDepths.size()-1)/q];
 }
 
+/// @brief 设关键帧 IMU bias 并同步给其预积分对象 mpImuPreintegrated(IMU 优化更新 bias 后调用)
 void KeyFrame::SetNewBias(const IMU::Bias &b)
 {
     unique_lock<mutex> lock(mMutexPose);
@@ -844,6 +897,7 @@ void KeyFrame::UpdateMap(Map* pMap)
     mpMap = pMap;
 }
 
+/// @brief 序列化前置:把地图点/共视/父子/回环/合并/相机/前后帧/预积分都转成 id 或备份对象(mBackup*),供存盘
 void KeyFrame::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP, set<GeometricCamera*>& spCam)
 {
     // Save the id of each MapPoint in this KF, there can be null pointer in the vector
