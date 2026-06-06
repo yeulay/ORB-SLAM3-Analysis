@@ -98,6 +98,17 @@ Frame::Frame(const Frame &frame)
 }
 
 
+// ============================================================================
+// Frame —— 普通帧(每帧图像都建一个;被选拔后才晋升为 KeyFrame)。ORB-SLAM3 三大数据结构之一。
+// 职责:提取 ORB 特征(ExtractORB)→ 去畸变(UndistortKeyPoints)→ 分配到网格(AssignFeaturesToGrid 加速搜索)→
+//   双目/RGBD 给每个特征算右目坐标与深度(ComputeStereoMatches / FromRGBD)→ 词袋(ComputeBoW)。
+// 位姿 mTcw + 缓存 mRcw/mRwc/mtcw/mOw;IMU:mImuBias/mVw/预积分 + mpPrevFrame(帧间预积分链)。
+// 与 KeyFrame 的区别:Frame 临时(跟踪用完即弃),KeyFrame 永久驻留地图并维护共视图/生成树。
+// 三个构造对应 双目(imLeft,imRight)/ RGBD(imGray,imDepth)/ 单目(imGray)三种输入。
+// ============================================================================
+/**
+ * @brief 双目帧构造:左右目分别提 ORB(两线程并行)→ 去畸变 → ComputeStereoMatches 双目匹配求深度 → 网格分配
+ */
 Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeStamp, ORBextractor* extractorLeft, ORBextractor* extractorRight, ORBVocabulary* voc, cv::Mat &K, cv::Mat &distCoef, const float &bf, const float &thDepth, GeometricCamera* pCamera, Frame* pPrevF, const IMU::Calib &ImuCalib)
     :mpcpi(NULL), mpORBvocabulary(voc),mpORBextractorLeft(extractorLeft),mpORBextractorRight(extractorRight), mTimeStamp(timeStamp), mK(K.clone()), mK_(Converter::toMatrix3f(K)), mDistCoef(distCoef.clone()), mbf(bf), mThDepth(thDepth),
      mImuCalib(ImuCalib), mpImuPreintegrated(NULL), mpPrevFrame(pPrevF),mpImuPreintegratedFrame(NULL), mpReferenceKF(static_cast<KeyFrame*>(NULL)), mbIsSet(false), mbImuPreintegrated(false),
@@ -197,6 +208,9 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
     AssignFeaturesToGrid();
 }
 
+/**
+ * @brief RGBD 帧构造:提 ORB → 去畸变 → 由深度图给每个特征算虚拟右目坐标(ComputeStereoFromRGBD)→ 网格分配
+ */
 Frame::Frame(const cv::Mat &imGray, const cv::Mat &imDepth, const double &timeStamp, ORBextractor* extractor,ORBVocabulary* voc, cv::Mat &K, cv::Mat &distCoef, const float &bf, const float &thDepth, GeometricCamera* pCamera,Frame* pPrevF, const IMU::Calib &ImuCalib)
     :mpcpi(NULL),mpORBvocabulary(voc),mpORBextractorLeft(extractor),mpORBextractorRight(static_cast<ORBextractor*>(NULL)),
      mTimeStamp(timeStamp), mK(K.clone()), mK_(Converter::toMatrix3f(K)),mDistCoef(distCoef.clone()), mbf(bf), mThDepth(thDepth),
@@ -286,6 +300,9 @@ Frame::Frame(const cv::Mat &imGray, const cv::Mat &imDepth, const double &timeSt
 }
 
 
+/**
+ * @brief 单目帧构造:提 ORB → 去畸变 → 无右目/深度(mvuRight/mvDepth 置 -1)→ 网格分配
+ */
 Frame::Frame(const cv::Mat &imGray, const double &timeStamp, ORBextractor* extractor,ORBVocabulary* voc, GeometricCamera* pCamera, cv::Mat &distCoef, const float &bf, const float &thDepth, Frame* pPrevF, const IMU::Calib &ImuCalib)
     :mpcpi(NULL),mpORBvocabulary(voc),mpORBextractorLeft(extractor),mpORBextractorRight(static_cast<ORBextractor*>(NULL)),
      mTimeStamp(timeStamp), mK(static_cast<Pinhole*>(pCamera)->toK()), mK_(static_cast<Pinhole*>(pCamera)->toK_()), mDistCoef(distCoef.clone()), mbf(bf), mThDepth(thDepth),
@@ -382,6 +399,7 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp, ORBextractor* extra
 }
 
 
+/// @brief 把所有去畸变特征点按像素位置分桶到 FRAME_GRID_COLS×ROWS 网格(GetFeaturesInArea 据此只搜邻近格,加速匹配)
 void Frame::AssignFeaturesToGrid()
 {
     // Fill matrix with points
@@ -415,6 +433,7 @@ void Frame::AssignFeaturesToGrid()
     }
 }
 
+/// @brief 调 ORBextractor 提取 ORB 特征点+描述子(flag=0 左目/单目,1 右目;x0~x1 列范围用于双目分块并行)
 void Frame::ExtractORB(int flag, const cv::Mat &im, const int x0, const int x1)
 {
     vector<int> vLapping = {x0,x1};
@@ -428,6 +447,7 @@ bool Frame::isSet() const {
     return mbIsSet;
 }
 
+/// @brief 设相机位姿 Tcw 并 UpdatePoseMatrices 刷新缓存(Rcw/Rwc/tcw/光心 mOw)
 void Frame::SetPose(const Sophus::SE3<float> &Tcw) {
     mTcw = Tcw;
 
@@ -454,6 +474,7 @@ Eigen::Vector3f Frame::GetVelocity() const
     return mVw;
 }
 
+/// @brief 由 IMU(body)位姿 (Rwb,twb) + 速度 Vwb 反推并设置相机位姿 Tcw(IMU 预测/初始化时用)
 void Frame::SetImuPoseVelocity(const Eigen::Matrix3f &Rwb, const Eigen::Vector3f &twb, const Eigen::Vector3f &Vwb)
 {
     mVw = Vwb;
@@ -509,6 +530,12 @@ Eigen::Vector3f Frame::GetRelativePoseTlr_translation() {
 }
 
 
+/**
+ * @brief 判断地图点是否落在本帧相机视锥内,并预存跟踪所需投影数据(Tracking 投影匹配的可见性筛选)
+ * @details 五重检查:① 相机系正深度 ② 投影 uv 在图像边界内 ③ 距离在该点尺度不变区间 [minD,maxD]
+ *   ④ 观测视角 cos ≥ viewingCosLimit(与地图点平均法向夹角不过大)⑤ 预测金字塔层。
+ *   通过则在 pMP 记 mTrackProjX/Y(+右目 XR)、mnTrackScaleLevel、mTrackViewCos、mbTrackInView=true,供 SearchByProjection 用。
+ */
 bool Frame::isInFrustum(MapPoint *pMP, float viewingCosLimit)
 {
     if(Nleft == -1){
@@ -654,6 +681,10 @@ Eigen::Vector3f Frame::inRefCoordinates(Eigen::Vector3f pCw)
     return mRcw * pCw + mtcw;
 }
 
+/**
+ * @brief 取以 (x,y) 为中心、半径 r、金字塔层 [minLevel,maxLevel] 内的特征点索引(网格加速)
+ * @details 比 KeyFrame 版多了金字塔层过滤;投影匹配只在候选区域 + 预测层附近搜索,避免全图遍历。
+ */
 vector<size_t> Frame::GetFeaturesInArea(const float &x, const float  &y, const float  &r, const int minLevel, const int maxLevel, const bool bRight) const
 {
     vector<size_t> vIndices;
@@ -744,6 +775,7 @@ void Frame::ComputeBoW()
     }
 }
 
+/// @brief 用畸变系数把原始特征点去畸变到 mvKeysUn(针孔模型;鱼眼/KB8 在投影模型内处理,故此处直接拷贝)
 void Frame::UndistortKeyPoints()
 {
     if(mDistCoef.at<float>(0)==0.0)
@@ -808,6 +840,11 @@ void Frame::ComputeImageBounds(const cv::Mat &imLeft)
     }
 }
 
+/**
+ * @brief 双目左右目特征匹配,为每个左目特征求右目横坐标 mvuRight 与深度 mvDepth
+ * @details 利用校正后双目"行对齐"特性:沿同一行的极线带,先按描述子距离粗选候选,再用 SAD 滑窗块匹配
+ *   精定位,最后抛物线拟合做亚像素细化。成功者得视差 → 深度 z = mbf/视差;失败置 -1(只剩单目约束)。
+ */
 void Frame::ComputeStereoMatches()
 {
     mvuRight = vector<float>(N,-1.0f);
@@ -981,6 +1018,7 @@ void Frame::ComputeStereoMatches()
 }
 
 
+/// @brief RGBD:由深度图直接给每个特征赋深度 mvDepth,并算虚拟右目坐标 mvuRight = u − mbf/z("伪双目")
 void Frame::ComputeStereoFromRGBD(const cv::Mat &imDepth)
 {
     mvuRight = vector<float>(N,-1);
