@@ -389,6 +389,25 @@ void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<M
     }
 }
 
+/**
+ * @brief 全图视觉-惯性 BA。两个调用方:
+ *   (A) LoopClosing::RunGlobalBundleAdjustment 在回环/融合完成后异步精化全图;
+ *   (B) LocalMapping::InitializeIMU 阶段 3 把 IMU 初始化结果 lock-in 到全图。
+ *
+ * 与 LocalInertialBA 的关键差别:
+ *   - 顶点集合: 地图全部 KF + 全部 MP, 而非局部窗口;
+ *   - 运行环境: 调用者通常会 RequestStop LocalMapping;
+ *   - 中断语义: 通过 pbStopFlag 检查 mbStopGBA, 允许新 loop/merge 提前中断;
+ *   - bInit=true 时: 给 GyroBias / AccBias 顶点加强 prior(priorG, priorA),
+ *     用于"刚做完阶段 1/2 IMU 初始化"的工况;
+ *   - nLoopId: 这次 GBA 的"版本号",写回时与 KeyFrame::mnBAGlobalForKF 比对,
+ *     若中途又触发新 GBA 则旧结果(LoopClosing.cc:2300 附近)被丢弃。
+ *
+ * 结果回写: 修改 KF->mTcwGBA 和 MP->mPosGBA(双缓冲),
+ *           由 LoopClosing 在 RequestStop LM 后批量交换到 mTcw / mWorldPos。
+ *
+ * 雅可比/残差细节见 docs/orb-slam3/ORB-SLAM3-IMU-Preintegration-Analysis.md §七。
+ */
 void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const long unsigned int nLoopId, bool *pbStopFlag, bool bInit, float priorG, float priorA, Eigen::VectorXd *vSingVal, bool *bHess)
 {
     long unsigned int maxKFid = pMap->GetMaxKFid();
@@ -2380,6 +2399,27 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
     return nIn;
 }
 
+/**
+ * @brief 视觉-惯性局部 BA。LocalMapping 在 VI 模式下例行调用。
+ *
+ * 顶点(可调):  当前 KF 及其 (maxOpt-1) 个时间向前邻居的
+ *              Pose (VertexPose) + Velocity (VertexVelocity)
+ *            + GyroBias (VertexGyroBias) + AccBias (VertexAccBias);
+ *            其后能看见同样 MP 的 KF 加入"固定 KF"集做约束;
+ *            可见 MapPoint 的 mWorldPos 也是优化变量。
+ *
+ * 边:
+ *   - 重投影边(单目 / 立体): EdgeMono / EdgeStereo,
+ *     接 KF Pose 顶点 + MP 顶点;
+ *   - IMU 因子边: EdgeInertial 连接相邻两 KF 的(P,V,B);
+ *   - Prior 边: 仅在 bRecInit(刚完成 IMU 阶段 1/2 初始化)时启用,
+ *     给陀螺/加速度计偏差一个先验约束防止漂移到不合理范围。
+ *
+ * bLarge: 若上次 BA 收敛快(残差变化小),可放大窗口和迭代次数以提精度。
+ * bRecInit: 是否处于"IMU 刚初始化"阶段,影响 prior 边的强度。
+ *
+ * IMU 残差表达式见综合文档 §9.3。
+ */
 void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int& num_fixedKF, int& num_OptKF, int& num_MPs, int& num_edges, bool bLarge, bool bRecInit)
 {
     Map* pCurrentMap = pKF->GetMap();

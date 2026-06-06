@@ -1791,6 +1791,30 @@ void Tracking::ResetFrameIMU()
 }
 
 
+/**
+ * @brief Tracking 线程主状态机入口。每次 GrabImage* 调用一次。
+ *
+ * 流程总览(详见 docs/orb-slam3/ORB-SLAM3-Tracking-Analysis.md):
+ *   ① 时间戳合理性检查 + IMU 模式下 PreintegrateIMU();
+ *   ② 状态机分支:
+ *       - NO_IMAGES_YET / NOT_INITIALIZED → StereoInitialization / MonocularInitialization;
+ *       - OK            → TrackWithMotionModel (恒速模型) 或 TrackReferenceKeyFrame (回退到 BoW);
+ *       - RECENTLY_LOST → IMU 模式下 PredictStateIMU 短期外推, 否则 Relocalization;
+ *       - LOST          → Relocalization 失败 → CreateMapInAtlas (新建活跃地图);
+ *   ③ TrackLocalMap() 用局部地图对当前帧位姿做投影匹配 + PoseOptimization 精化;
+ *   ④ NeedNewKeyFrame() 多条件判定是否插入关键帧:
+ *       - 与上次重定位的间隔;
+ *       - 跟踪上的 MapPoint 占参考 KF 的比例;
+ *       - 视差 / 单目场景的近点比;
+ *       - LocalMapping 是否 AcceptKeyFrames(若否,且强制条件不满足,则跳过插入);
+ *   ⑤ if 决定插入: CreateNewKeyFrame() → InsertKeyFrame(LocalMapping)
+ *                                       + InsertKeyFrame(LoopClosing);
+ *   ⑥ 把外点 MapPoint 置 nullptr(避免下一帧仍参与匹配);
+ *   ⑦ 写出位姿到 mlRelativeFramePoses / mlpReferences 等轨迹缓冲。
+ *
+ * 设计原则: 永不阻塞后端 —— 插入 KF 时仅 push_back + InterruptBA, 不等 LM 处理。
+ * bStepByStep 是调试用的"单步执行"开关(系统会等待外部 SetStepByStep 触发)。
+ */
 void Tracking::Track()
 {
 

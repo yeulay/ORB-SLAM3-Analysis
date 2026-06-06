@@ -241,6 +241,28 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
 
 }
 
+/**
+ * @brief 双目/双目-惯性模式下,处理一帧立体图像 + 该帧时间段内的 IMU 数据。
+ *
+ * 工程定位:
+ *   - 同步接口: 调用者(主线程)直接拿到 Tcw, Tracking 不开独立线程。
+ *   - 永不阻塞后端: 即使 LocalMapping/LoopClosing 正在做 BA,本函数仅向其队列
+ *     push KeyFrame*, 然后立刻返回。
+ *
+ * 处理链路:
+ *   1. settings_ 提供畸变矩阵时先做 cv::remap 立体校正;
+ *   2. settings_->needToResize() 时下采样;
+ *   3. 把 vImuMeas 中本帧时间段的 IMU 测量 Push 到 Tracker 的 mlQueueImuData;
+ *   4. 调 mpTracker->GrabImageStereo, 内部构造 Frame 并进入 Track() 主状态机;
+ *   5. 返回 Tcw = mCurrentFrame.GetPose() (Sophus::SE3f, 相机系→世界系)。
+ *
+ * @param imLeft     畸变左目灰度图(若 settings_ 已开启 rectify 则可为畸变图)
+ * @param imRight    畸变右目灰度图
+ * @param timestamp  帧时间戳(秒),需与 IMU 时间戳同步
+ * @param vImuMeas   该帧与上一帧之间收集到的 IMU 测量(可空,纯视觉模式忽略)
+ * @param filename   可选文件名,仅做调试输出用
+ * @return T_cw      当前帧位姿(相机系→世界系)
+ */
 Sophus::SE3f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timestamp, const vector<IMU::Point>& vImuMeas, string filename)
 {
     if(mSensor!=STEREO && mSensor!=IMU_STEREO)
@@ -325,6 +347,20 @@ Sophus::SE3f System::TrackStereo(const cv::Mat &imLeft, const cv::Mat &imRight, 
     return Tcw;
 }
 
+/**
+ * @brief RGB-D / RGB-D-惯性模式下,处理一帧 RGB + 深度图(+IMU)。
+ *
+ * 关键工程细节:
+ *   - RGB-D 模式被实现为"伪双目":深度图在 Frame::ComputeStereoFromRGBD 中
+ *     通过 mvuRight[i] = u_L - mbf/d 构造虚拟右目视差,
+ *     从而复用立体视觉的 PoseOptimization / LocalBA 代码路径。
+ *   - mbf = baseline * fx 由 yaml 的 Camera.bf 提供(虚拟基线,用于权重控制)。
+ *
+ * 与 TrackStereo 的差异: 本函数不做 cv::remap 立体校正,
+ * 但仍可按 settings_->needToResize() 同步缩放 RGB 和 Depth。
+ *
+ * @return T_cw 当前帧位姿
+ */
 Sophus::SE3f System::TrackRGBD(const cv::Mat &im, const cv::Mat &depthmap, const double &timestamp, const vector<IMU::Point>& vImuMeas, string filename)
 {
     if(mSensor!=RGBD  && mSensor!=IMU_RGBD)
@@ -396,6 +432,21 @@ Sophus::SE3f System::TrackRGBD(const cv::Mat &im, const cv::Mat &depthmap, const
     return Tcw;
 }
 
+/**
+ * @brief 单目/单目-惯性模式下,处理一帧灰度图(+IMU)。
+ *
+ * 与 Stereo/RGBD 模式的本质差异:
+ *   - 初始化要求多视图: 单目走 MonocularInitialization → CreateInitialMapMonocular,
+ *     需要前后两帧之间有足够视差才能三角化首批地图点。
+ *   - 尺度模糊: 纯单目仅恢复"形状",真实尺度未知;
+ *     单目-惯性(IMU_MONOCULAR)模式下,尺度由 InitializeIMU 多阶段恢复,
+ *     并由 ScaleRefinement 周期性精化(LocalMapping.cc:1429)。
+ *
+ * 退出短路: mbShutDown 表示 System::Shutdown 已被调用,
+ * 此时返回单位 SE3 以避免对销毁中的对象的访问。
+ *
+ * @return T_cw 当前帧位姿(若处于 Shutdown 中则为单位阵)
+ */
 Sophus::SE3f System::TrackMonocular(const cv::Mat &im, const double &timestamp, const vector<IMU::Point>& vImuMeas, string filename)
 {
 

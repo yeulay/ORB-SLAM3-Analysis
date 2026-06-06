@@ -61,6 +61,29 @@ void LocalMapping::SetTracker(Tracking *pTracker)
     mpTracker=pTracker;
 }
 
+/**
+ * @brief LocalMapping 后台线程主循环。关键帧驱动,频率约 3-5 Hz。
+ *
+ * 单轮迭代的主要步骤(详见 docs/orb-slam3/ORB-SLAM3-Comprehensive-Synthesis.md §5.2):
+ *   1) SetAcceptKeyFrames(false)  → 通知 Tracking 自己即将进入计算阶段,
+ *      若非"强制插入"的关键帧条件, Tracking 应延后下一次 CreateNewKeyFrame;
+ *   2) ProcessNewKeyFrame()       → 计算 BoW、把当前 KF 关联到已有 MP 的观测、
+ *                                    UpdateConnections 更新共视图、AddKeyFrame 入 Atlas;
+ *   3) MapPointCulling()          → 剔除近期创建但观测稀疏的 MP;
+ *   4) CreateNewMapPoints()       → 与共视邻居 KF 做 BoW 匹配 + 三角化;
+ *   5) SearchInNeighbors()        → 1°/2° 共视邻居中地图点融合(Fuse);
+ *   6) [若 KF 数 > 2]
+ *        Optimizer::LocalBundleAdjustment   (纯视觉)
+ *        Optimizer::LocalInertialBA         (VI 模式)
+ *      此处的 mbAbortBA 由 Tracking::InterruptBA 触发,
+ *      允许 BA 在新 KF 到来时中途退出,保证前端永不阻塞;
+ *   7) IMU 多阶段初始化(VI 模式)的触发点也在此循环:
+ *        InitializeIMU(prior, prior, bFIBA) 阶段 1/2/3 ;
+ *        ScaleRefinement (周期性尺度精化,仅单目-惯性);
+ *   8) KeyFrameCulling()          → 共视冗余 KF 剔除(IMU 模式更保守);
+ *   9) SetAcceptKeyFrames(true)   + LoopClosing::InsertKeyFrame(pKF);
+ *  10) 检查 Stop / Reset / Finish 请求(暂停四态机详见 §7.8 文档)。
+ */
 void LocalMapping::Run()
 {
     mbFinished = false;

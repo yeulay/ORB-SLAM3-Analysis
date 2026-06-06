@@ -87,6 +87,29 @@ void LoopClosing::SetLocalMapper(LocalMapping *pLocalMapper)
 }
 
 
+/**
+ * @brief LoopClosing 后台线程主循环。关键帧驱动,频率随 LocalMapping 上游。
+ *
+ * 单轮迭代:
+ *   1) 从 mlpLoopKeyFrameQueue 取 mpCurrentKF;
+ *   2) NewDetectCommonRegions()  → ORB-SLAM3 的统一回环 + 融合检测:
+ *        - 优先复用上一 KF 已成功匹配的 loop/merge KF 做 SE3/Sim3 Refine;
+ *        - 否则 KeyFrameDatabase::DetectLoop/MergeCandidates + BoW 验证;
+ *      若候选 KF 与 mpCurrentKF 同属一张活跃地图 → 回环路径;
+ *      若分属不同地图              → 融合路径;
+ *   3) 路径分发:
+ *        - 同地图: CorrectLoop()       → Sim3 修正 → Essential Graph 优化
+ *                                       → 启动 GBA 子线程;
+ *        - 跨地图(纯视觉): MergeLocal() → welding window 双侧扩展
+ *                                        → Atlas::ChangeMap 把当前地图合入匹配地图
+ *                                        → 焊接 BA + Essential Graph;
+ *        - 跨地图(VI):     MergeLocal2() → 同上 + IMU 尺度统一 + 速度传播
+ *                                          + 预积分重置 + MergeInertialBA;
+ *   4) 检查 Reset / Finish 请求。
+ *
+ * GBA 子线程的生命周期管理(版本号 mnFullBAIdx + mbStopGBA + detach)
+ * 详见 docs/orb-slam3/ORB-SLAM3-Comprehensive-Synthesis.md §7.4。
+ */
 void LoopClosing::Run()
 {
     mbFinished =false;
@@ -966,6 +989,26 @@ int LoopClosing::FindMatchesByProjection(KeyFrame* pCurrentKF, KeyFrame* pMatche
     return num_matches;
 }
 
+/**
+ * @brief 同一地图内的回环校正流程。
+ *
+ * 前置条件: NewDetectCommonRegions 已确认 mpLoopMatchedKF 与 mpCurrentKF 在
+ *           同一张活跃地图,且 Sim3/SE3 验证通过。
+ *
+ * 关键步骤:
+ *   1) 请求 LocalMapping 暂停(RequestStop + 自旋等待 isStopped),
+ *      避免在校正过程中 LM 又插入新 KF 造成数据竞争;
+ *   2) 若 GBA 正在跑 → 设置 mbStopGBA + 递增 mnFullBAIdx + detach 旧线程;
+ *   3) 用回环 Sim3 Scw 修正 mpCurrentKF 及其共视邻居的位姿:
+ *         S_wi^corr = Scw_loop · Scw_cur^-1 · Swi_old   (§9.4 Sim3 公式)
+ *      位姿写入 KeyFrame::mTcwGBA(双缓冲)而非直接覆盖 mTcw;
+ *   4) 把修正传播到所有相关 MapPoint: 通过 mPosGBA 双缓冲临时存放;
+ *   5) 通过 ORBmatcher::Fuse 合并回环侧与当前侧重叠的 MapPoint;
+ *   6) KeyFrame::UpdateConnections + 添加 loop edge;
+ *   7) OptimizeEssentialGraph (Sim3 / 7DoF) 或 OptimizeEssentialGraph4DoF (VI 模式);
+ *   8) 启动 GBA 子线程 RunGlobalBundleAdjustment 做全局精化;
+ *   9) LocalMapping::Release 解除暂停。
+ */
 void LoopClosing::CorrectLoop()
 {
     //cout << "Loop detected!" << endl;
@@ -1212,6 +1255,30 @@ void LoopClosing::CorrectLoop()
     mLastLoopKFid = mpCurrentKF->mnId; //TODO old varible, it is not use in the new algorithm
 }
 
+/**
+ * @brief 跨地图融合(纯视觉模式)。当 NewDetectCommonRegions 发现 mpCurrentKF
+ *        与另一张地图的 mpMergeMatchedKF 是 common region 时被调用。
+ *
+ * Welding Window 双侧构造(论文 §VII-B,详见 §7.1 综合文档):
+ *   - 当前地图侧: mpCurrentKF 的 GetBestCovisibilityKeyFrames(25) + 递归扩展
+ *                到目标窗口大小(numTemporalKFs);
+ *   - 匹配地图侧: 对 mpMergeMatchedKF 做对称扩展。
+ *
+ * 核心步骤:
+ *   1) 请求 LocalMapping 暂停 + 处理可能正在跑的旧 GBA;
+ *   2) 把当前地图所有 KF/MP 经 Sim3 变换到匹配地图坐标系;
+ *   3) Atlas::ChangeMap → 把当前地图的 KF/MP 迁入匹配地图,
+ *      原地图 SetMapBad 等待 RemoveBadMaps;
+ *   4) 焊接 BA: Optimizer::LocalBundleAdjustment(mpCurrentKF,
+ *               vpLocalCurrentWindowKFs, vpMergeConnectedKFs, &bStop)
+ *      显式给定可调集 + 固定集,把两侧窗口拉成一致;
+ *   5) Essential Graph 优化(含 welding edges)传播到全图;
+ *   6) 释放 LocalMapping。
+ *
+ * 与 MergeLocal2 的差别(VI 模式)见综合文档 §7.2 对比表。
+ *
+ * @note numTemporalKFs=25 是纯视觉模式选择(IMU 模式下 MergeLocal2 改为 11)。
+ */
 void LoopClosing::MergeLocal()
 {
     int numTemporalKFs = 25; //Temporal KFs in the local window if the map is inertial.
