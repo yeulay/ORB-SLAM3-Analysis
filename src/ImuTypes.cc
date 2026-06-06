@@ -31,11 +31,21 @@ namespace IMU
 
 const float eps = 1e-4;
 
+// ============================================================================
+// IMU 预积分(对应 VINS 的 IntegrationBase;理论见 Forster TRO2017 / docs/vins/VINS-IMU-Preintegration-Analysis.md)
+// 把两关键帧间的高频 IMU 测量"预积分"成 ΔR/ΔV/ΔP 三个相对量(不依赖绝对位姿),供 BA 作 IMU 因子约束。
+// 核心类 Preintegrated:dR/dV/dP(预积分增量)+ JRg/JVg/JVa/JPg/JPa(增量对 bias 的一阶 Jacobian,
+//   使 bias 微调时无需重积分,GetDelta*(b) 一阶修正即可)+ C(9×9 协方差,白化 IMU 因子用)。
+// ============================================================================
+
+/// @brief 用 SVD(R=UΣVᵀ → UVᵀ)把旋转矩阵重正交化,消除 dR 反复相乘的数值累积误差
 Eigen::Matrix3f NormalizeRotation(const Eigen::Matrix3f &R){
     Eigen::JacobiSVD<Eigen::Matrix3f> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
     return svd.matrixU() * svd.matrixV().transpose();
 }
 
+/// @brief SO(3) 右 Jacobian Jr(φ):李代数扰动 → 群上右乘扰动的映射(小角度退化为 I)
+/// @details 公式 I − (1−cos d)/d²·W + (d−sin d)/d³·W²(W=φ^)。预积分协方差传播与 bias Jacobian 递推都要用。
 Eigen::Matrix3f RightJacobianSO3(const float &x, const float &y, const float &z)
 {
     Eigen::Matrix3f I;
@@ -58,6 +68,7 @@ Eigen::Matrix3f RightJacobianSO3(const Eigen::Vector3f &v)
     return RightJacobianSO3(v(0),v(1),v(2));
 }
 
+/// @brief 右 Jacobian 的逆 Jr⁻¹(φ)(把旋转误差映射回李代数 / IMU 残差对旋转求导用)
 Eigen::Matrix3f InverseRightJacobianSO3(const float &x, const float &y, const float &z)
 {
     Eigen::Matrix3f I;
@@ -81,6 +92,10 @@ Eigen::Matrix3f InverseRightJacobianSO3(const Eigen::Vector3f &v)
     return InverseRightJacobianSO3(v(0),v(1),v(2));
 }
 
+/**
+ * @brief 单步旋转增量:由角速度(去 bias)× dt 算 ΔRi = Exp((ω−bw)·dt) 及其右 Jacobian rightJ
+ * @details deltaR 用罗德里格斯展开(小角度退化为 I+W);rightJ 供协方差传播。是 IntegrateNewMeasurement 的旋转子步。
+ */
 IntegratedRotation::IntegratedRotation(const Eigen::Vector3f &angVel, const Bias &imuBias, const float &time) {
     const float x = (angVel(0)-imuBias.bwx)*time;
     const float y = (angVel(1)-imuBias.bwy)*time;
@@ -104,6 +119,10 @@ IntegratedRotation::IntegratedRotation(const Eigen::Vector3f &angVel, const Bias
     }
 }
 
+/**
+ * @brief 预积分对象构造:绑定 IMU 噪声协方差(Nga 测量 / NgaWalk 随机游走)并按初始 bias 清零所有增量
+ * @details 一个 Preintegrated 累积"两关键帧之间"的全部 IMU,是 BA 里 EdgeInertial 惯性因子的数据载体。
+ */
 Preintegrated::Preintegrated(const Bias &b_, const Calib &calib)
 {
     Nga = calib.Cov;
@@ -165,6 +184,7 @@ void Preintegrated::Initialize(const Bias &b_)
     mvMeasurements.clear();
 }
 
+/// @brief 用更新后的 bias(bu)对存档的全部 IMU 测量重新积分(bias 变化过大、一阶修正不够准时调用)
 void Preintegrated::Reintegrate()
 {
     std::unique_lock<std::mutex> lock(mMutex);
@@ -174,6 +194,14 @@ void Preintegrated::Reintegrate()
         IntegrateNewMeasurement(aux[i].a,aux[i].w,aux[i].t);
 }
 
+/**
+ * @brief 累积一个 IMU 测量,更新预积分增量 dR/dV/dP + 协方差 C + bias Jacobian
+ * @details ★更新顺序 P→V→R(P 依赖旧 V/R,V 依赖旧 R,R 最后更新),与 Forster 公式一致:
+ *   dP += dV·dt + ½·dR·acc·dt²;dV += dR·acc·dt;dR = Normalize(dR·Exp((ω−bw)dt))。
+ *   协方差:C = A·C·Aᵀ + B·Nga·Bᵀ(A 状态转移 / B 噪声转移),随机游走块 += NgaWalk。
+ *   bias Jacobian(JRg/JVg/JVa/JPg/JPa)同步递推 → 后续 SetNewBias 时 GetDelta*(b) 一阶修正即可、无需重积分。
+ *   acc/ω 已先减去当前线性化 bias b;原始测量存入 mvMeasurements 供 Reintegrate。
+ */
 void Preintegrated::IntegrateNewMeasurement(const Eigen::Vector3f &acceleration, const Eigen::Vector3f &angVel, const float &dt)
 {
     mvMeasurements.push_back(integrable(acceleration,angVel,dt));
@@ -234,6 +262,7 @@ void Preintegrated::IntegrateNewMeasurement(const Eigen::Vector3f &acceleration,
     dT += dt;
 }
 
+/// @brief 合并前一段预积分:用本段 bias 把"前段+本段"原始测量重新连续积分成一段(关键帧剔除/合并时用)
 void Preintegrated::MergePrevious(Preintegrated* pPrev)
 {
     if (pPrev==this)
@@ -260,6 +289,7 @@ void Preintegrated::MergePrevious(Preintegrated* pPrev)
 
 }
 
+/// @brief 设新 bias bu 并记录其与线性化点 b 的偏差 db(供 GetUpdated* 一阶修正;不立即重积分)
 void Preintegrated::SetNewBias(const Bias &bu_)
 {
     std::unique_lock<std::mutex> lock(mMutex);
@@ -280,6 +310,8 @@ IMU::Bias Preintegrated::GetDeltaBias(const Bias &b_)
 }
 
 
+// ↓↓ bias 一阶修正:给定新 bias b_,返回修正后的增量(无需重积分)——dR·Exp(JRg·δbg)、dV+JVg·δbg+JVa·δba 等。
+//    这正是 VINS IMU Factor 里 corrected_delta_q/v/p 的同款做法(预积分对 bias 线性化)。Updated* 用 db、Original* 取原值 ↓↓
 Eigen::Matrix3f Preintegrated::GetDeltaRotation(const Bias &b_)
 {
     std::unique_lock<std::mutex> lock(mMutex);
@@ -392,6 +424,7 @@ std::ostream& operator<< (std::ostream &out, const Bias &b)
     return out;
 }
 
+/// @brief 设置 IMU 标定:相机-IMU 外参 Tbc/Tcb + 由噪声密度(ng/na 测量、ngw/naw 随机游走)构造协方差对角阵
 void Calib::Set(const Sophus::SE3<float> &sophTbc, const float &ng, const float &na, const float &ngw, const float &naw) {
     mbIsSet = true;
     const float ng2 = ng*ng;
