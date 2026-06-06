@@ -26,6 +26,13 @@ namespace ORB_SLAM3
 
 long unsigned int Map::nNextId=0;
 
+// ============================================================================
+// Map —— 单张地图容器(一个 Atlas 持有多张 Map,见 Atlas.cc)
+// 内容:关键帧集 mspKeyFrames + 地图点集 mspMapPoints + 参考地图点 mvpReferenceMapPoints(供跟踪/可视化)。
+// KF id 范围:mnInitKFid(本图首个 KF id)~ mnMaxKFid——Atlas 据此保证跨地图 id 不重叠。
+// 每图独立 IMU 状态:mbIsInertial(是否惯性)、mbImuInitialized、mbIMU_BA1/BA2(IMU 初始化三阶段标志)。
+// 变更计数:mnMapChange / mnBigChangeIdx(通知 Viewer、触发 GBA 后重绘)。线程安全:mMutexMap。
+// ============================================================================
 Map::Map():mnMaxKFid(0),mnBigChangeIdx(0), mbImuInitialized(false), mnMapChange(0), mpFirstRegionKF(static_cast<KeyFrame*>(NULL)),
 mbFail(false), mIsInUse(false), mHasTumbnail(false), mbBad(false), mnMapChangeNotified(0), mbIsInertial(false), mbIMU_BA1(false), mbIMU_BA2(false)
 {
@@ -57,6 +64,11 @@ Map::~Map()
     mvpKeyFrameOrigins.clear();
 }
 
+/**
+ * @brief 向地图加入关键帧,并维护 KF id 边界(init / max / lower)
+ * @details 首个 KF 设为 mnInitKFid / mpKFinitial(地图原点);更新 mnMaxKFid(供 Atlas 算下一图起始 id)、
+ *   mpKFlowerID(最小 id KF,GBA 固定基准等用)。mspKeyFrames 用 set 去重。
+ */
 void Map::AddKeyFrame(KeyFrame *pKF)
 {
     unique_lock<mutex> lock(mMutexMap);
@@ -83,6 +95,8 @@ void Map::AddMapPoint(MapPoint *pMP)
     mspMapPoints.insert(pMP);
 }
 
+// ↓↓ 每图独立的 IMU 状态(VI 模式):mbImuInitialized + 三阶段标志 mbIMU_BA1/BA2,
+//    对应 LocalMapping::InitializeIMU 的渐进式 IMU 初始化(纯视觉 → 粗 IMU(BA1)→ 精 IMU(BA2))↓↓
 void Map::SetImuInitialized()
 {
     unique_lock<mutex> lock(mMutexMap);
@@ -211,6 +225,7 @@ void Map::SetStoredMap()
     mIsInUse = false;
 }
 
+/// @brief 清空地图(解除各 KF 的 map 归属、清 KF/MP 集、复位 IMU 标志、mnMaxKFid 回到 mnInitKFid)
 void Map::clear()
 {
 //    for(set<MapPoint*>::iterator sit=mspMapPoints.begin(), send=mspMapPoints.end(); sit!=send; sit++)
@@ -249,6 +264,12 @@ bool Map::IsBad()
 }
 
 
+/**
+ * @brief 对整张地图施加相似变换(尺度 s + 旋转/平移 T):IMU 初始化/尺度精化后对齐世界系
+ * @details 遍历所有 KF:位姿平移 ×s 后左乘 T、速度按 bScaledVel 决定是否 ×s;遍历所有 MP:世界坐标
+ *   ×s 后施加 R/t 并 UpdateNormalAndDepth。★这是视觉-惯性初始化把"无尺度视觉地图"对齐到
+ *   "米制重力世界系"的落点(对应 VINS 的 visualInitialAlign 尺度恢复+重力对齐)。
+ */
 void Map::ApplyScaledRotation(const Sophus::SE3f &T, const float s, const bool bScaledVel)
 {
     unique_lock<mutex> lock(mMutexMap);
@@ -356,6 +377,7 @@ void Map::SetLastMapChange(int currentChangeId)
     mnMapChangeNotified = currentChangeId;
 }
 
+/// @brief 序列化前置:清理跨图/坏观测,备份 MP/KF 到 mvpBackup*,记录 origin/lower KF id
 void Map::PreSave(std::set<GeometricCamera*> &spCams)
 {
     int nMPWithoutObs = 0;
@@ -424,6 +446,7 @@ void Map::PreSave(std::set<GeometricCamera*> &spCams)
 
 }
 
+/// @brief 反序列化后置:从备份恢复 MP/KF 集合,重建实例间交叉引用(KF↔MP 观测、ORB 词典、KFDB)
 void Map::PostLoad(KeyFrameDatabase* pKFDB, ORBVocabulary* pORBVoc/*, map<long unsigned int, KeyFrame*>& mpKeyFrameId*/, map<unsigned int, GeometricCamera*> &mpCams)
 {
     std::copy(mvpBackupMapPoints.begin(), mvpBackupMapPoints.end(), std::inserter(mspMapPoints, mspMapPoints.begin()));

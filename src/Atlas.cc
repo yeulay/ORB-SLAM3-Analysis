@@ -26,6 +26,15 @@
 namespace ORB_SLAM3
 {
 
+// ============================================================================
+// Atlas —— ORB-SLAM3 的招牌创新:多地图管理器(Multi-Map / Active Map 体系)
+// 持有一组地图 mspMaps + 唯一的"当前活动地图" mpCurrentMap;绝大多数查询接口都委托给当前地图。
+// ★与 VINS 单地图的根本区别:跟踪丢失时不清空重启,而是 CreateNewMap 新开一张地图继续(旧地图保留),
+//   日后若与旧地图重识别成功,由 LoopClosing 的地图合并(MergeLocal)把两图缝合 → 鲁棒性大幅提升。
+// ★跨地图 KF/MP id 全局唯一:新地图起始 KF id = mnLastInitKFidMap(= 旧地图最大 KF id + 1),
+//   使各地图关键帧 id 不重叠,合并时无需重编号(详见 docs/orb-slam3/ORB-SLAM3-Comprehensive-Synthesis.md §7)。
+// 线程安全:mMutexAtlas 保护地图集合与当前地图指针。
+// ============================================================================
 Atlas::Atlas(){
     mpCurrentMap = static_cast<Map*>(NULL);
 }
@@ -55,6 +64,11 @@ Atlas::~Atlas()
     }
 }
 
+/**
+ * @brief 新建一张地图并设为当前地图(跟踪丢失/初始化时调用,旧地图存档保留)
+ * @details 把当前地图标记为 stored(SetStoredMap)归档;新地图起始 KF id = mnLastInitKFidMap
+ *   (= 旧地图最大 KF id + 1),保证跨地图 KF id 全局唯一;新地图 insert 进 mspMaps 并设为 current。
+ */
 void Atlas::CreateNewMap()
 {
     unique_lock<mutex> lock(mMutexAtlas);
@@ -76,6 +90,10 @@ void Atlas::CreateNewMap()
     mspMaps.insert(mpCurrentMap);
 }
 
+/**
+ * @brief 切换当前活动地图(地图合并 / 重定位到另一张地图时调用)
+ * @details 原当前地图归档(SetStoredMap),pMap 设为新的 current。与 CreateNewMap 配合实现"多地图接力"。
+ */
 void Atlas::ChangeMap(Map* pMap)
 {
     unique_lock<mutex> lock(mMutexAtlas);
@@ -112,6 +130,10 @@ void Atlas::AddMapPoint(MapPoint* pMP)
     pMapMP->AddMapPoint(pMP);
 }
 
+/**
+ * @brief 注册相机模型(去重):已存在同型同参相机则返回旧实例,否则加入 mvpCameras 并返回
+ * @details 支持 Pinhole / KannalaBrandt8(鱼眼);多相机/多序列共享同一相机模型,避免重复存储。
+ */
 GeometricCamera* Atlas::AddCamera(GeometricCamera* pCam)
 {
     //Check if the camera already exists
@@ -158,6 +180,7 @@ std::vector<GeometricCamera*> Atlas::GetAllCameras()
     return mvpCameras;
 }
 
+// ↓↓ 以下多数接口是"委托给当前地图 mpCurrentMap"的转发:Atlas 只管多地图调度,具体增删查交给 Map ↓↓
 void Atlas::SetReferenceMapPoints(const std::vector<MapPoint*> &vpMPs)
 {
     unique_lock<mutex> lock(mMutexAtlas);
@@ -246,6 +269,7 @@ void Atlas::clearAtlas()
     mnLastInitKFidMap = 0;
 }
 
+/// @brief 取当前活动地图(为空则自动 CreateNewMap;地图处于 Bad 态时自旋等待其恢复)
 Map* Atlas::GetCurrentMap()
 {
     unique_lock<mutex> lock(mMutexAtlas);
@@ -299,6 +323,7 @@ bool Atlas::isImuInitialized()
     return mpCurrentMap->isImuInitialized();
 }
 
+/// @brief 序列化前置:备份所有有效地图到 mvpBackupMaps(剔除空地图)、逐地图 PreSave + 收集相机集
 void Atlas::PreSave()
 {
     if(mpCurrentMap){
@@ -332,6 +357,7 @@ void Atlas::PreSave()
     RemoveBadMaps();
 }
 
+/// @brief 反序列化后置:从 mvpBackupMaps 恢复地图集合,逐地图 PostLoad(重建 KFDB / 词典 / 相机引用)
 void Atlas::PostLoad()
 {
     map<unsigned int,GeometricCamera*> mpCams;
