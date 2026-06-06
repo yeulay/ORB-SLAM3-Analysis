@@ -36,6 +36,18 @@ MapPoint::MapPoint():
     mpReplaced = static_cast<MapPoint*>(NULL);
 }
 
+// ============================================================================
+// MapPoint —— 地图点(3D 路标),ORB-SLAM3 三大数据结构之一(对应 VINS 逆深度特征,但这里存世界系 3D 坐标)
+// 关键成员:
+//   mWorldPos       世界系 3D 坐标(SetWorldPos/GetWorldPos,mGlobalMutex+mMutexPos 保护)
+//   mObservations   map<KF*,(leftIdx,rightIdx)>:哪些 KF、在第几个特征点观测到本点(双目存左右索引);nObs=观测计数
+//   mpRefKF         参考关键帧(创建本点的 KF;被删则迁到首个剩余观测 KF)
+//   mDescriptor     代表性 ORB 描述子(取所有观测中"到其余描述子中位汉明距离最小"者)
+//   mNormalVector   平均观测方向(可见性/尺度判据);mfMin/MaxDistance:尺度不变距离范围(预测金字塔层用)
+//   mbBad/mpReplaced  坏点标记 / 被替换指针(融合用);mnVisible/mnFound:可见/命中计数(冗余剔除判据)
+//   mn*ForKF/ForFrame 一族:防重复处理标记(被某 KF 的 LocalBA/回环/融合处理过即记下,避免重复入队)
+// 三个构造:从 KF 三角化 / 从逆深度+uv(协作建图)/ 从普通 Frame(临时点)。线程安全:mMutexPos + mMutexFeatures。
+// ============================================================================
 MapPoint::MapPoint(const Eigen::Vector3f &Pos, KeyFrame *pRefKF, Map* pMap):
     mnFirstKFid(pRefKF->mnId), mnFirstFrame(pRefKF->mnFrameId), nObs(0), mnTrackReferenceForFrame(0),
     mnLastFrameSeen(0), mnBALocalForKF(0), mnFuseCandidateForKF(0), mnLoopPointForKF(0), mnCorrectedByKF(0),
@@ -138,6 +150,11 @@ KeyFrame* MapPoint::GetReferenceKeyFrame()
     return mpRefKF;
 }
 
+/**
+ * @brief 登记一次观测:关键帧 pKF 的第 idx 个特征点看到本地图点
+ * @details mObservations[pKF] 存 (leftIdx,rightIdx)——双目右目索引存 rightIndex;nObs 累加(非双目且有右目匹配 +2,否则 +1)。
+ *   与 KeyFrame::AddMapPoint 配套,维护"地图点 ↔ 关键帧"双向观测关系。
+ */
 void MapPoint::AddObservation(KeyFrame* pKF, int idx)
 {
     unique_lock<mutex> lock(mMutexFeatures);
@@ -165,6 +182,10 @@ void MapPoint::AddObservation(KeyFrame* pKF, int idx)
         nObs++;
 }
 
+/**
+ * @brief 注销某关键帧对本点的观测;若剩余观测 ≤2 则判本点为坏点(SetBadFlag)
+ * @details 同步减 nObs;若被删的是 mpRefKF 则把参考帧迁移到首个剩余观测 KF。
+ */
 void MapPoint::EraseObservation(KeyFrame* pKF)
 {
     bool bBad=false;
@@ -213,6 +234,10 @@ int MapPoint::Observations()
     return nObs;
 }
 
+/**
+ * @brief 标记本点为坏点并从系统彻底摘除:通知所有观测 KF 擦除匹配 + 从地图删除
+ * @details 置 mbBad、清空 mObservations,逐 KF 调 EraseMapPointMatch(解除 KF→MP 引用),最后 mpMap->EraseMapPoint。
+ */
 void MapPoint::SetBadFlag()
 {
     map<KeyFrame*, tuple<int,int>> obs;
@@ -245,6 +270,11 @@ MapPoint* MapPoint::GetReplaced()
     return mpReplaced;
 }
 
+/**
+ * @brief 用 pMP 替换本点(地图点融合):把本点的所有观测/计数转移给 pMP,本点置坏
+ * @details 遍历本点观测的 KF:若 pMP 未在该 KF → 改该 KF 的匹配指向 pMP 并给 pMP 加观测;若已在 → 仅擦本点匹配(避免重复)。
+ *   转移 found/visible 计数,pMP 重算代表描述子。LocalMapping/LoopClosing 的 SearchAndFuse 大量调用。
+ */
 void MapPoint::Replace(MapPoint* pMP)
 {
     if(pMP->mnId==this->mnId)
@@ -326,6 +356,10 @@ float MapPoint::GetFoundRatio()
     return static_cast<float>(mnFound)/mnVisible;
 }
 
+/**
+ * @brief 计算代表性描述子:在所有观测的描述子中,选"到其余描述子中位汉明距离最小"者
+ * @details 同一 3D 点在不同帧/视角下描述子有差异,取中位距离最小者作鲁棒代表(后续 matching / 回环检索都用它)。
+ */
 void MapPoint::ComputeDistinctiveDescriptors()
 {
     // Retrieve all observed descriptors
@@ -423,6 +457,11 @@ bool MapPoint::IsInKeyFrame(KeyFrame *pKF)
     return (mObservations.count(pKF));
 }
 
+/**
+ * @brief 更新平均观测方向 mNormalVector 与尺度不变距离范围 mfMin/MaxDistance
+ * @details 法向 = 各观测 KF 相机中心 → 本点 的单位向量均值;距离范围由参考帧观测距离 × 该特征金字塔层尺度推得。
+ *   供 GetMin/MaxDistanceInvariance + PredictScale 在匹配时预测应在哪一金字塔层搜索。
+ */
 void MapPoint::UpdateNormalAndDepth()
 {
     map<KeyFrame*,tuple<int,int>> observations;
@@ -511,6 +550,11 @@ float MapPoint::GetMaxDistanceInvariance()
     return 1.2f * mfMaxDistance;
 }
 
+/**
+ * @brief 据当前观测距离预测该点应在图像金字塔的哪一层(距离越近层数越高)
+ * @details nScale = ceil(log(mfMaxDistance/currentDist)/log(scaleFactor)),截断到 [0, nLevels-1]。匹配时据此缩小搜索层范围。
+ *   (另有 Frame* 重载,逻辑相同。)
+ */
 int MapPoint::PredictScale(const float &currentDist, KeyFrame* pKF)
 {
     float ratio;
@@ -569,6 +613,7 @@ void MapPoint::UpdateMap(Map* pMap)
     mpMap = pMap;
 }
 
+/// @brief 序列化前置:把观测/参考帧/被替换点都转成 id 备份(mBackup*),并剔除不在保存集内的观测
 void MapPoint::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP)
 {
     mBackupReplacedId = -1;
@@ -599,6 +644,7 @@ void MapPoint::PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP)
     }
 }
 
+/// @brief 反序列化后置:据 id 表把 mBackup* 还原成 mpRefKF/mpReplaced/mObservations 的实例指针
 void MapPoint::PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsigned int, MapPoint*>& mpMPid)
 {
     mpRefKF = mpKFid[mBackupRefKFId];
