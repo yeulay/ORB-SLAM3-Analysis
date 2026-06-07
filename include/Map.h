@@ -157,17 +157,18 @@ public:
 
 protected:
 
-    long unsigned int mnId;
+    // ===== 单地图核心容器(前生今世;类职责见 Map.cc 文件头)=====
+    long unsigned int mnId;            ///< 地图全局 id(构造 nNextId++)
 
-    std::set<MapPoint*> mspMapPoints;
-    std::set<KeyFrame*> mspKeyFrames;
+    std::set<MapPoint*> mspMapPoints;  ///< 本图所有地图点。前生:AddMapPoint 加;今世:GetAllMapPoints 遍历;销毁:EraseMapPoint 删 / clear 清空
+    std::set<KeyFrame*> mspKeyFrames;  ///< 本图所有关键帧。前生:AddKeyFrame 加(顺带更新 mnMaxKFid/mpKFinitial/mpKFlowerID);销毁:EraseKeyFrame 删
 
-    // Save/load, the set structure is broken in libboost 1.58 for ubuntu 16.04, a vector is serializated
+    // set 在 libboost1.58/U16.04 序列化有问题,故备份成 vector
     std::vector<MapPoint*> mvpBackupMapPoints;
     std::vector<KeyFrame*> mvpBackupKeyFrames;
 
-    KeyFrame* mpKFinitial;
-    KeyFrame* mpKFlowerID;
+    KeyFrame* mpKFinitial;             ///< 地图原点 KF(前生:首个 AddKeyFrame 设;今世:GetOriginKF;本质图优化基准)
+    KeyFrame* mpKFlowerID;             ///< 最小 id 的存活 KF(AddKeyFrame/EraseKeyFrame 维护)
 
     unsigned long int mnBackupKFinitialID;
     unsigned long int mnBackupKFlowerID;

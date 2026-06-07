@@ -141,16 +141,17 @@ public:
 
 protected:
 
-    std::set<Map*> mspMaps;
-    std::set<Map*> mspBadMaps;
-    // Its necessary change the container from set to vector because libboost 1.58 and Ubuntu 16.04 have an error with this cointainer
-    std::vector<Map*> mvpBackupMaps;
+    // ===== 多地图体系成员(前生今世;类职责见 Atlas.cc 文件头)=====
+    std::set<Map*> mspMaps;          ///< 所有活动地图。前生:CreateNewMap 时 insert;今世:GetAllMaps 遍历;SetMapBad 移入 mspBadMaps
+    std::set<Map*> mspBadMaps;       ///< 坏地图(空地图/合并后废弃);RemoveBadMaps 清理
+    // set→vector 是 libboost1.58/Ubuntu16.04 兼容问题
+    std::vector<Map*> mvpBackupMaps; ///< 序列化备份(PreSave 填、PostLoad 恢复)
 
-    Map* mpCurrentMap;
+    Map* mpCurrentMap;               ///< ★当前活动地图(几乎所有查询接口委托给它)。前生:CreateNewMap/ChangeMap 设;今世:GetCurrentMap 读(空则自动建)
 
-    std::vector<GeometricCamera*> mvpCameras;
+    std::vector<GeometricCamera*> mvpCameras;  ///< 相机模型集(AddCamera 去重加入;多序列共享)
 
-    unsigned long int mnLastInitKFidMap;
+    unsigned long int mnLastInitKFidMap;  ///< ★下一张新地图的起始 KF id(=当前地图最大 KF id+1)。前生:构造 initKFid;今世:CreateNewMap 更新——保证跨地图 KF id 全局唯一
 
     Viewer* mpViewer;
     bool mHasViewer;

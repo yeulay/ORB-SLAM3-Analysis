@@ -426,7 +426,8 @@ public:
 
     // The following variables need to be accessed trough a mutex to be thread safe.
 protected:
-    // sophus poses
+    // ★位姿与缓存(前生:SetPose(Tcw) 一次写入并算好以下全部派生量;今世:GetPose/GetPoseInverse 高频读、
+    //   回环 OptimizeEssentialGraph / GBA 更新)。mTcw=世界→相机,mTwc=其逆,mRcw/mRwc=旋转缓存(免每次求逆)。mMutexPose 保护。
     Sophus::SE3<float> mTcw;
     Eigen::Matrix3f mRcw;
     Sophus::SE3<float> mTwc;
@@ -442,10 +443,11 @@ protected:
     Sophus::SE3<float> mTlr;
     Sophus::SE3<float> mTrl;
 
-    // Imu bias
+    // IMU 偏置。前生:晋升时从 Frame 拷入;今世:SetNewBias 更新并同步给 mpImuPreintegrated;IMU 优化/初始化时改。
     IMU::Bias mImuBias;
 
-    // MapPoints associated to keypoints
+    // 本帧各特征点关联的地图点(按特征索引,无则 NULL)。前生:晋升时从 Frame 拷;今世:AddMapPoint/Replace/EraseMapPointMatch
+    //   增改删,与 MapPoint::mObservations 互为双向;LocalBA/回环遍历它。mMutexFeatures 保护。
     std::vector<MapPoint*> mvpMapPoints;
     // For save relation without pointer, this is necessary for save/load function
     std::vector<long long int> mvBackupMapPointsId;
@@ -457,13 +459,17 @@ protected:
     // Grid over the image to speed up feature matching
     std::vector< std::vector <std::vector<size_t> > > mGrid;
 
+    // ★共视图(前生:UpdateConnections 据共享地图点统计建立;今世:AddConnection/EraseConnection 增改、UpdateBestCovisibles 重排序;
+    //   GetVectorCovisibleKeyFrames 等供 LocalBA/回环取邻域)。weights=共视地图点数,ordered=按权降序缓存。mMutexConnections 保护。
     std::map<KeyFrame*,int> mConnectedKeyFrameWeights;
     std::vector<KeyFrame*> mvpOrderedConnectedKeyFrames;
     std::vector<int> mvOrderedWeights;
     // For save relation without pointer, this is necessary for save/load function
     std::map<long unsigned int, int> mBackupConnectedKeyFrameIdWeights;
 
-    // Spanning Tree and Loop Edges
+    // ★生成树与回环边(本质图优化骨架)。
+    // mpParent:前生 UpdateConnections 首次连接认最高共视者为父;今世 ChangeParent 改(SetBadFlag 删帧时修复树)。
+    // mspChildrens:AddChild/EraseChild 维护。mspLoopEdges/mspMergeEdges:AddLoopEdge/AddMergeEdge 加(并置 mbNotErase 保护本帧不被删)。
     bool mbFirstConnection;
     KeyFrame* mpParent;
     std::set<KeyFrame*> mspChildrens;
@@ -475,10 +481,11 @@ protected:
     std::vector<long unsigned int> mvBackupLoopEdgesId;
     std::vector<long unsigned int> mvBackupMergeEdgesId;
 
-    // Bad flags
+    // 删除控制。mbNotErase:有回环边/正被处理时禁删(SetNotErase 置 / SetErase 解);
+    //   mbToBeErased:被请求删但当前不可删,延后到 SetErase 真删;mbBad:SetBadFlag 真正剔除后置位(isBad 到处检查并跳过)。
     bool mbNotErase;
     bool mbToBeErased;
-    bool mbBad;    
+    bool mbBad;
 
     float mHalfBaseline; // Only for visualization
 
