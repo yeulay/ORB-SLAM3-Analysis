@@ -36,10 +36,25 @@ namespace ORB_SLAM3
     const int ORBmatcher::TH_LOW = 50;
     const int ORBmatcher::HISTO_LENGTH = 30;
 
+    // ========================================================================
+    // ORBmatcher —— ORB 描述子匹配引擎(Tracking / LocalMapping / LoopClosing 三线程共用)
+    // 多套匹配策略,按"已知什么先验"选择:
+    //   · SearchByProjection:已知位姿(运动模型/局部地图/Sim3),把 3D 地图点投影到图像、小半径内找描述子最近邻(跟踪主力)
+    //   · SearchByBoW:无位姿先验,靠词袋同节点缩小候选(重定位、回环两帧匹配)
+    //   · SearchForTriangulation:两 KF 间受极线约束的匹配,为三角化新点(LocalMapping)
+    //   · SearchByProjection(Sim3) / Fuse:回环/合并时按 Sim3 投影匹配并融合重复地图点
+    // 通用技巧:mfNNratio(Lowe 最近/次近比)+ mbCheckOrientation(旋转直方图 ComputeThreeMaxima 剔方向不一致误匹配)
+    //   + DescriptorDistance(256bit 汉明距离;阈值 TH_HIGH=100 / TH_LOW=50)。
+    // ========================================================================
     ORBmatcher::ORBmatcher(float nnratio, bool checkOri): mfNNratio(nnratio), mbCheckOrientation(checkOri)
     {
     }
 
+    /**
+     * @brief 把局部地图点投影到当前帧,在预测尺度层 + 视角半径内找匹配(Tracking 局部地图跟踪主力)
+     * @details 仅对 isInFrustum 通过的点,在其投影位置 GetFeaturesInArea(半径 = RadiusByViewingCos×th)内
+     *   取描述子最近邻(过 Lowe ratio + 方向一致性)。bFarPoints 可选剔除过远点。返回新增匹配数。
+     */
     int ORBmatcher::SearchByProjection(Frame &F, const vector<MapPoint*> &vpMapPoints, const float th, const bool bFarPoints, const float thFarPoints)
     {
         int nmatches=0, left = 0, right = 0;
@@ -212,6 +227,7 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /// @brief 据观测视角余弦定搜索半径:正视(cos≥0.998)给小半径 2.5,斜视给 4.0(斜视投影更不准故放宽)
     float ORBmatcher::RadiusByViewingCos(const float &viewCos)
     {
         if(viewCos>0.998)
@@ -220,6 +236,10 @@ namespace ORB_SLAM3
             return 4.0;
     }
 
+    /**
+     * @brief 用词袋加速把当前帧匹配到参考 KF 的地图点(重定位 / 跟踪参考帧,无位姿先验时用)
+     * @details 只在 BoW 特征向量同一节点(mFeatVec)内两两比描述子(大幅缩小候选),过 Lowe ratio + 旋转直方图一致性。
+     */
     int ORBmatcher::SearchByBoW(KeyFrame* pKF,Frame &F, vector<MapPoint*> &vpMapPointMatches)
     {
         const vector<MapPoint*> vpMapPointsKF = pKF->GetMapPointMatches();
@@ -424,6 +444,7 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /// @brief 按给定 Sim3 位姿 Scw 把地图点投影到 KF 找匹配(回环:把回环帧及其共视点投到当前 KF 找对应)
     int ORBmatcher::SearchByProjection(KeyFrame* pKF, Sophus::Sim3f &Scw, const vector<MapPoint*> &vpPoints,
                                        vector<MapPoint*> &vpMatched, int th, float ratioHamming)
     {
@@ -531,6 +552,7 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /// @brief 同上 Sim3 投影匹配的变体:每个候选点附带来源 KF(地图合并时用,便于记录跨地图对应关系)
     int ORBmatcher::SearchByProjection(KeyFrame* pKF, Sophus::Sim3<float> &Scw, const std::vector<MapPoint*> &vpPoints, const std::vector<KeyFrame*> &vpPointsKFs,
                                        std::vector<MapPoint*> &vpMatched, std::vector<KeyFrame*> &vpMatchedKF, int th, float ratioHamming)
     {
@@ -645,6 +667,11 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /**
+     * @brief 单目初始化:前两帧之间做窗口搜索匹配(为本质矩阵/单应估计提供 2D-2D 对应)
+     * @details 在上一匹配位置 vbPrevMatched 附近 windowSize 窗口内找描述子最近邻,过 Lowe ratio + 旋转直方图。
+     *   只在单目初始化阶段用(此时尚无 3D 地图点)。
+     */
     int ORBmatcher::SearchForInitialization(Frame &F1, Frame &F2, vector<cv::Point2f> &vbPrevMatched, vector<int> &vnMatches12, int windowSize)
     {
         int nmatches=0;
@@ -762,6 +789,10 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /**
+     * @brief 词袋加速匹配两关键帧的地图点(回环候选验证 / 地图合并求 KF↔KF 对应)
+     * @details 同 BoW 节点内比描述子;输出 vpMatches12(pKF1 第 i 点 ↔ pKF2 地图点)。结果喂给 Sim3Solver 解相似变换。
+     */
     int ORBmatcher::SearchByBoW(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &vpMatches12)
     {
         const vector<cv::KeyPoint> &vKeysUn1 = pKF1->mvKeysUn;
@@ -904,6 +935,11 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /**
+     * @brief 两共视 KF 间受极线约束的特征匹配,为三角化新地图点(LocalMapping::CreateNewMapPoints)
+     * @details 只匹配各自尚无地图点的特征;用基础矩阵把候选点到极线的距离作约束,BoW 缩候选 + 方向一致性。
+     *   输出匹配对供后续三角化生成新点(填补共视区域的地图)。
+     */
     int ORBmatcher::SearchForTriangulation(KeyFrame *pKF1, KeyFrame *pKF2,
                                            vector<pair<size_t, size_t> > &vMatchedPairs, const bool bOnlyStereo, const bool bCoarse)
     {
@@ -1145,6 +1181,11 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /**
+     * @brief 将一批地图点投影到 KF,与已有特征/地图点融合去重(LocalMapping/LoopClosing 冗余消除)
+     * @details 投影点落在某特征邻域且描述子够近时:该特征已有地图点 → 用观测更多者 Replace 另一个;无则 AddObservation。
+     *   返回融合数。这是"同一 3D 点被建成多个"的清理手段(共视区域去冗余)。
+     */
     int ORBmatcher::Fuse(KeyFrame *pKF, const vector<MapPoint *> &vpMapPoints, const float th, const bool bRight)
     {
         GeometricCamera* pCamera;
@@ -1337,6 +1378,10 @@ namespace ORB_SLAM3
         return nFused;
     }
 
+    /**
+     * @brief 按 Sim3 位姿 Scw 把地图点投影到 KF 做融合(回环/合并:用回环侧点替换当前侧重复点)
+     * @details 与上 Fuse 类似但投影用 Sim3;冲突点记入 vpReplacePoint,待回环位姿修正后由调用方统一 Replace。
+     */
     int ORBmatcher::Fuse(KeyFrame *pKF, Sophus::Sim3f &Scw, const vector<MapPoint *> &vpPoints, float th, vector<MapPoint *> &vpReplacePoint)
     {
         // Get Calibration Parameters for later projection
@@ -1673,6 +1718,11 @@ namespace ORB_SLAM3
         return nFound;
     }
 
+    /**
+     * @brief 把上一帧的地图点按当前帧预测位姿投影过来匹配(Tracking 恒速运动模型跟踪)
+     * @details 用运动模型给的当前位姿,把 LastFrame 地图点投到 CurrentFrame,在投影点 + 预测尺度层邻域找最近邻。
+     *   帧间运动小、最快的跟踪路径;bMono 区分单目(无右目一致性检查)。
+     */
     int ORBmatcher::SearchByProjection(Frame &CurrentFrame, const Frame &LastFrame, const float th, const bool bMono)
     {
         int nmatches = 0;
@@ -1886,6 +1936,10 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /**
+     * @brief 重定位:把候选 KF 的地图点投影到当前帧补充匹配(PnP 粗位姿后的二次投影匹配)
+     * @details 跳过 sAlreadyFound(已匹配上的),用更宽 ORBdist 阈值在投影邻域找更多对应,扩充 PnP 内点以精化位姿。
+     */
     int ORBmatcher::SearchByProjection(Frame &CurrentFrame, KeyFrame *pKF, const set<MapPoint*> &sAlreadyFound, const float th , const int ORBdist)
     {
         int nmatches = 0;
@@ -2009,6 +2063,11 @@ namespace ORB_SLAM3
         return nmatches;
     }
 
+    /**
+     * @brief 取旋转直方图中票数最高的三个 bin(方向一致性检验:只保留主旋转方向的匹配,剔除误匹配)
+     * @details 各匹配对的主方向差落入 HISTO_LENGTH=30 个 bin;若第 2/3 高远低于第 1 高(<0.1)则只留第 1
+     *   (旋转应一致),据此把方向偏离的匹配判为外点。mbCheckOrientation 开启时各 Search* 调用。
+     */
     void ORBmatcher::ComputeThreeMaxima(vector<int>* histo, const int L, int &ind1, int &ind2, int &ind3)
     {
         int max1=0;
@@ -2055,6 +2114,7 @@ namespace ORB_SLAM3
 
 // Bit set count operation from
 // http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel
+    /// @brief 两个 256bit ORB 描述子的汉明距离(逐 32bit 对异或结果做位计数 popcount;匹配的基础度量)
     int ORBmatcher::DescriptorDistance(const cv::Mat &a, const cv::Mat &b)
     {
         const int *pa = a.ptr<int32_t>();
