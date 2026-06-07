@@ -49,6 +49,7 @@ bool sortByVal(const pair<MapPoint*, int> &a, const pair<MapPoint*, int> &b)
     return (a.second < b.second);
 }
 
+/// @brief 全局 BA 便捷封装:取地图全部 KF 与 MP 调 BundleAdjustment(回环后 RunGlobalBundleAdjustment 用)
 void Optimizer::GlobalBundleAdjustemnt(Map* pMap, int nIterations, bool* pbStopFlag, const unsigned long nLoopKF, const bool bRobust)
 {
     vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
@@ -57,6 +58,11 @@ void Optimizer::GlobalBundleAdjustemnt(Map* pMap, int nIterations, bool* pbStopF
 }
 
 
+/**
+ * @brief 全量 Bundle Adjustment:联合优化给定关键帧位姿 + 地图点 3D 坐标(g2o,重投影误差)
+ * @details 顶点 = KF 位姿(SE3)+ MP 位置,边 = 每条观测的重投影误差(Huber 鲁棒核);首帧固定消 gauge。
+ *   ★ORB 相对 VINS 的最大精度杠杆:全图联合优化 pose & landmark(VINS 位姿图只优化 pose、路标不参与)。
+ */
 void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<MapPoint *> &vpMP,
                                  int nIterations, bool* pbStopFlag, const unsigned long nLoopKF, const bool bRobust)
 {
@@ -830,6 +836,11 @@ void Optimizer::FullInertialBA(Map *pMap, int its, const bool bFixLocal, const l
 }
 
 
+/**
+ * @brief 仅优化单帧位姿的 BA(地图点固定):Tracking 每帧精化位姿的主力(motion-only BA)
+ * @details 顶点只有当前帧 SE3,边 = 帧对各地图点的重投影误差(Huber);多轮优化 + 卡方剔外点(设 mvbOutlier)。
+ *   返回内点数。比全 BA 快得多,适合实时跟踪每帧调用。
+ */
 int Optimizer::PoseOptimization(Frame *pFrame)
 {
     g2o::SparseOptimizer optimizer;
@@ -1132,6 +1143,11 @@ int Optimizer::PoseOptimization(Frame *pFrame)
     return nInitialCorrespondences-nBad;
 }
 
+/**
+ * @brief 局部 BA:优化当前 KF 共视邻域的 KF 位姿 + 它们观测的地图点(LocalMapping 每来新 KF 调)
+ * @details 局部窗口 = 共视 KF(可优化)+ 观测到这些点但不在窗口的 KF(固定);边 = 重投影误差 + 两轮剔外点。
+ *   ★局部窗口由共视图动态决定(对照 VINS 硬编码滑窗 10 帧),信息约束更多是 ORB 更准的原因之一。
+ */
 void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap, int& num_fixedKF, int& num_OptKF, int& num_MPs, int& num_edges)
 {
     // Local KeyFrames: First Breath Search from Current Keyframe
@@ -1517,6 +1533,11 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
 }
 
 
+/**
+ * @brief 本质图优化(回环修正主力):在 生成树 + 高共视边 + 回环边 构成的位姿图上优化所有 KF 的 Sim3 位姿
+ * @details 顶点 = 各 KF 的 Sim3(吸收尺度漂移),边 = 相邻/共视/回环的相对 Sim3 约束;只优化位姿不含路标(故快),
+ *   优化后据新位姿批量校正地图点。是 CorrectLoop 把回环误差均摊到全轨迹的核心(对照 VINS 4-DoF 位姿图)。
+ */
 void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
                                        const LoopClosing::KeyFrameAndPose &NonCorrectedSim3,
                                        const LoopClosing::KeyFrameAndPose &CorrectedSim3,
@@ -2131,6 +2152,10 @@ void Optimizer::OptimizeEssentialGraph(KeyFrame* pCurKF, vector<KeyFrame*> &vpFi
     }
 }
 
+/**
+ * @brief 优化两关键帧间的 Sim3 相对位姿(回环验证:精化 Sim3Solver 给的闭式初值)
+ * @details 顶点 = Sim3 g2oS12,边 = 两侧地图点的双向重投影误差;剔外点后回报内点数。bFixScale 时退化为 SE3。
+ */
 int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &vpMatches1, g2o::Sim3 &g2oS12, const float th2,
                             const bool bFixScale, Eigen::Matrix<double,7,7> &mAcumHessian, const bool bAllPoints)
 {
@@ -3079,6 +3104,11 @@ Eigen::MatrixXd Optimizer::Marginalize(const Eigen::MatrixXd &H, const int &star
     return res;
 }
 
+/**
+ * @brief 惯性初始化优化:固定视觉位姿,只估重力方向 Rwg、尺度 scale、陀螺/加计 bias(IMU 初始化核心)
+ * @details 顶点 = 重力方向 + 尺度 + 各帧速度 + bias,边 = IMU 预积分约束;priorG/priorA 给 bias 先验。
+ *   解出后 LocalMapping::InitializeIMU 用它把无尺度视觉地图对齐到米制重力世界系(对照 VINS LinearAlignment+RefineGravity)。
+ */
 void Optimizer::InertialOptimization(Map *pMap, Eigen::Matrix3d &Rwg, double &scale, Eigen::Vector3d &bg, Eigen::Vector3d &ba, bool bMono, Eigen::MatrixXd  &covInertial, bool bFixedVel, bool bGauss, float priorG, float priorA)
 {
     Verbose::PrintMess("inertial optimization", Verbose::VERBOSITY_NORMAL);
@@ -4528,6 +4558,10 @@ void Optimizer::MergeInertialBA(KeyFrame* pCurrKF, KeyFrame* pMergeKF, bool *pbS
     pMap->IncreaseChangeIndex();
 }
 
+/**
+ * @brief VI 跟踪的单帧位姿优化(含到上一关键帧的 IMU 约束 + 视觉重投影):VI 模式 TrackLocalMap 用
+ * @details 优化当前帧 位姿/速度/bias,边 = 视觉重投影 + IMU 预积分(到上一 KF)+ 上一 KF 先验;多轮剔外点。
+ */
 int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit)
 {
     g2o::SparseOptimizer optimizer;
@@ -4912,6 +4946,7 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
     return nInitialCorrespondences-nBad;
 }
 
+/// @brief VI 跟踪单帧位姿优化的变体:IMU 约束连到上一普通帧(而非上一 KF),用于帧间紧邻的 VI 跟踪
 int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
 {
     g2o::SparseOptimizer optimizer;
