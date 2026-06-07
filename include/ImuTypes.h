@@ -208,24 +208,21 @@ public:
     }
 
 public:
-    float dT;
-    Eigen::Matrix<float,15,15> C;
-    Eigen::Matrix<float,15,15> Info;
-    Eigen::DiagonalMatrix<float,6> Nga, NgaWalk;
-
-    // Values for the original bias (when integration was computed)
-    Bias b;
-    Eigen::Matrix3f dR;
-    Eigen::Vector3f dV, dP;
-    Eigen::Matrix3f JRg, JVg, JVa, JPg, JPa;
-    Eigen::Vector3f avgA, avgW;
+    // ===== Preintegrated 预积分量(前生:IntegrateNewMeasurement 逐 IMU 累积;今世:GetDelta*/IMU 因子用;Initialize/Reintegrate 重置)=====
+    float dT;                                    ///< 累积积分时长
+    Eigen::Matrix<float,15,15> C;                ///< 预积分协方差(随每量测传播 C=A·C·Aᵀ+B·Nga·Bᵀ;白化 IMU 因子用)
+    Eigen::Matrix<float,15,15> Info;             ///< 信息矩阵(C 的逆)
+    Eigen::DiagonalMatrix<float,6> Nga, NgaWalk; ///< IMU 测量噪声 / 随机游走协方差(构造时由 Calib 设)
+    Bias b;                                      ///< ★线性化点 bias(本段预积分基于它;前生:Initialize 设)
+    Eigen::Matrix3f dR;                          ///< 预积分旋转增量 ΔR(IntegrateNewMeasurement 累乘 + NormalizeRotation)
+    Eigen::Vector3f dV, dP;                      ///< 预积分速度/位置增量 ΔV/ΔP
+    Eigen::Matrix3f JRg, JVg, JVa, JPg, JPa;     ///< ★增量对 bias 的一阶 Jacobian(bias 微调时 GetDelta*(b) 一阶修正,免重积分)
+    Eigen::Vector3f avgA, avgW;                  ///< 平均加速度/角速度(IMU 初始化判静止用)
 
 
 private:
-    // Updated bias
-    Bias bu;
-    // Dif between original and updated bias
-    // This is used to compute the updated values of the preintegration
+    Bias bu;                                     ///< 更新后的 bias(SetNewBias 设;今世:GetUpdated* 用)
+    // bu 与线性化点 b 之差,供 GetUpdated* 一阶修正预积分量;偏离过大才 Reintegrate 重积分
     Eigen::Matrix<float,6,1> db;
 
     struct integrable

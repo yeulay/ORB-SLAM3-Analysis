@@ -165,7 +165,8 @@ public:
 
 
 private:
-    //Sophus/Eigen migration
+    // ★相机位姿与缓存(前生:SetPose(Tcw)→UpdatePoseMatrices 一次算好以下全部;今世:GetPose/GetRwc/GetOw 高频读)。
+    //   mTcw=世界→相机;mRwc/mOw=旋转/光心(世界系);mRcw/mtcw=mTcw 的旋转/平移分量。Frame 是临时帧、用完即弃,故无 mutex。
     Sophus::SE3<float> mTcw;
     Eigen::Matrix<float,3,3> mRwc;
     Eigen::Matrix<float,3,1> mOw;
@@ -222,15 +223,14 @@ public:
     // Number of KeyPoints.
     int N;
 
-    // Vector of keypoints (original for visualization) and undistorted (actually used by the system).
-    // In the stereo case, mvKeysUn is redundant as images must be rectified.
-    // In the RGB-D case, RGB images can be distorted.
+    // 特征点(前生:构造时 ExtractORB 提取)。mvKeys=原始(左/右目,可视化),mvKeysUn=去畸变后(系统实际用,UndistortKeyPoints 算)。
+    //   双目已校正故 mvKeysUn 冗余;RGBD 的 RGB 可能有畸变。今世:匹配/投影/三角化到处用。
     std::vector<cv::KeyPoint> mvKeys, mvKeysRight;
     std::vector<cv::KeyPoint> mvKeysUn;
 
-    // Corresponding stereo coordinate and depth for each keypoint.
+    // 各特征点关联的地图点(前生:跟踪 SearchByProjection/BoW 匹配上时填;今世:PoseOptimization 用、晋升 KeyFrame 时拷走;无则 NULL)
     std::vector<MapPoint*> mvpMapPoints;
-    // "Monocular" keypoints have a negative value.
+    // 各特征点的右目横坐标 mvuRight 与深度 mvDepth(前生:ComputeStereoMatches/FromRGBD 算;★单目恒为 -1)
     std::vector<float> mvuRight;
     std::vector<float> mvDepth;
 
@@ -241,8 +241,7 @@ public:
     // ORB descriptor, each row associated to a keypoint.
     cv::Mat mDescriptors, mDescriptorsRight;
 
-    // MapPoints associated to keypoints, NULL pointer if no association.
-    // Flag to identify outlier associations.
+    // 外点标记(前生:PoseOptimization 卡方检验判定;今世:跟踪据此剔除误匹配,不计入有效观测)
     std::vector<bool> mvbOutlier;
     int mnCloseMPs;
 
@@ -259,11 +258,12 @@ public:
     // Imu calibration
     IMU::Calib mImuCalib;
 
-    // Imu preintegration from last keyframe
+    // ★IMU 预积分链(前生:Tracking 构造帧时设;今世:PredictStateIMU 递推预测、VI 位姿优化用)。
+    //   到上一关键帧的预积分:
     IMU::Preintegrated* mpImuPreintegrated;
     KeyFrame* mpLastKeyFrame;
 
-    // Pointer to previous frame
+    // 到上一普通帧的预积分(帧间紧邻的 VI 跟踪用):
     Frame* mpPrevFrame;
     IMU::Preintegrated* mpImuPreintegratedFrame;
 
