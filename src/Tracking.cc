@@ -1735,6 +1735,10 @@ void Tracking::PreintegrateIMU()
 }
 
 
+/**
+ * @brief 用 IMU 预积分从上一帧(或上一 KF)递推当前帧的位姿/速度(VI 模式给跟踪更准的初值)
+ * @details 取最近 bias 对预积分一阶修正,递推 Rwb/twb/Vwb;短时无视觉时也能维持位姿(IMU-only 兜底)。
+ */
 bool Tracking::PredictStateIMU()
 {
     if(!mCurrentFrame.mpPrevFrame)
@@ -2356,6 +2360,10 @@ void Tracking::Track()
 }
 
 
+/**
+ * @brief 双目/RGBD 初始化:首帧即可由深度直接三角化地图点(无需运动视差),建初始 KF 与地图
+ * @details 双目/RGBD 单帧就有 metric 深度,故初始化比单目简单且尺度真实(无需后续定标)。
+ */
 void Tracking::StereoInitialization()
 {
     if(mCurrentFrame.N>500)
@@ -2469,6 +2477,10 @@ void Tracking::StereoInitialization()
 }
 
 
+/**
+ * @brief 单目初始化:两帧间匹配 + 算单应 H / 基础矩阵 F,选模型恢复相对位姿并三角化首批地图点
+ * @details 需足够视差;成功后建两个初始 KF + 初始地图点,★尺度任意(后续由 IMU 初始化或回环定标)。
+ */
 void Tracking::MonocularInitialization()
 {
 
@@ -2741,6 +2753,10 @@ void Tracking::CheckReplacedInLastFrame()
 }
 
 
+/**
+ * @brief 参考关键帧跟踪:词袋匹配当前帧↔参考 KF 的地图点,再仅优化位姿(运动模型失效时的回退)
+ * @details ComputeBoW → ORBmatcher::SearchByBoW → 以上一帧位姿作初值 PoseOptimization → 剔外点。
+ */
 bool Tracking::TrackReferenceKeyFrame()
 {
     // Compute Bag of Words vector
@@ -2875,6 +2891,11 @@ void Tracking::UpdateLastFrame()
     }
 }
 
+/**
+ * @brief 恒速运动模型跟踪:用上一帧位姿×速度预测当前位姿,投影匹配上一帧地图点后仅优化位姿(最快路径)
+ * @details 预测位姿 → ORBmatcher::SearchByProjection(投影上一帧点)→ PoseOptimization 仅优化位姿 → 剔外点。
+ *   匹配过少则回退 TrackReferenceKeyFrame;VI 模式有 IMU 时用 PredictStateIMU 给更准预测。
+ */
 bool Tracking::TrackWithMotionModel()
 {
     ORBmatcher matcher(0.9,true);
@@ -2970,6 +2991,11 @@ bool Tracking::TrackWithMotionModel()
         return nmatchesMap>=10;
 }
 
+/**
+ * @brief 局部地图跟踪:把局部地图点投影到当前帧补充匹配并再优化位姿(每帧位姿精化的主力步)
+ * @details UpdateLocalMap(取共视邻域 KF 及其地图点)→ SearchLocalPoints 投影更多局部点 → PoseOptimization
+ *   (VI 模式用含 IMU 的优化)→ 据内点数判定跟踪成功与否。在运动模型/参考帧跟踪拿到初位姿后调用。
+ */
 bool Tracking::TrackLocalMap()
 {
 
@@ -3085,6 +3111,11 @@ bool Tracking::TrackLocalMap()
     }
 }
 
+/**
+ * @brief 判定是否需要插入新关键帧(跟踪质量/时间间隔/共视冗余等多条件综合)
+ * @details 距上个 KF 过久、或跟踪内点相对参考帧降到阈值、且 LocalMapping 空闲可接收时返回 true。
+ *   插太密增负担、太疏易丢跟踪——精度与实时的权衡(对照 VINS 滑窗次新帧判定)。
+ */
 bool Tracking::NeedNewKeyFrame()
 {
     if((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !mpAtlas->GetCurrentMap()->isImuInitialized())
@@ -3237,6 +3268,9 @@ bool Tracking::NeedNewKeyFrame()
         return false;
 }
 
+/**
+ * @brief 把当前帧晋升为关键帧:新建 KeyFrame,双目/RGBD 顺带三角化近距离点,交给 LocalMapping 队列
+ */
 void Tracking::CreateNewKeyFrame()
 {
     if(mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
@@ -3438,6 +3472,7 @@ void Tracking::SearchLocalPoints()
     }
 }
 
+/// @brief 构建局部地图:取当前帧共视 KF 及邻居(UpdateLocalKeyFrames)+ 它们的地图点(UpdateLocalPoints),供 TrackLocalMap 投影
 void Tracking::UpdateLocalMap()
 {
     // This is for visualization
@@ -3630,6 +3665,11 @@ void Tracking::UpdateLocalKeyFrames()
     }
 }
 
+/**
+ * @brief 重定位:跟踪丢失后用词袋检索候选 KF + PnP 求位姿,投影匹配验证以恢复跟踪
+ * @details KeyFrameDatabase 检索候选 → 每候选 SearchByBoW 求 3D-2D → MLPnPsolver RANSAC 求位姿 →
+ *   SearchByProjection 补匹配 + PoseOptimization 迭代,内点足够则重定位成功(对照 VINS 的回环快速重定位)。
+ */
 bool Tracking::Relocalization()
 {
     Verbose::PrintMess("Starting relocalization", Verbose::VERBOSITY_NORMAL);
