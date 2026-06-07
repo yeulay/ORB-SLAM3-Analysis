@@ -318,6 +318,11 @@ bool LocalMapping::CheckNewKeyFrames()
     return(!mlNewKeyFrames.empty());
 }
 
+/**
+ * @brief 从队列取出新关键帧做预处理:算词袋、更新地图点观测、补共视连接、加入地图
+ * @details ① ComputeBoW ② 给本帧已匹配地图点登记观测(AddObservation)+ 新建点入 MapPointCulling 待检表
+ *   ③ UpdateConnections 建共视图 ④ Atlas 加入该 KF。是 LocalMapping 主循环处理每个新 KF 的第一步。
+ */
 void LocalMapping::ProcessNewKeyFrame()
 {
     {
@@ -366,6 +371,11 @@ void LocalMapping::EmptyQueue()
         ProcessNewKeyFrame();
 }
 
+/**
+ * @brief 剔除近期新建但质量差的地图点(冗余/外点清理)
+ * @details 对 mlpRecentAddedMapPoints 检查:被跟踪命中率 < 25%、或建后经过足够多 KF 仍观测过少 → SetBadFlag。
+ *   保证只有稳定可靠的点长留地图。
+ */
 void LocalMapping::MapPointCulling()
 {
     // Check Recent Added MapPoints
@@ -408,6 +418,11 @@ void LocalMapping::MapPointCulling()
 }
 
 
+/**
+ * @brief 用当前 KF 与其共视 KF 三角化生成新地图点(扩充地图)
+ * @details 对每个高共视邻居:ORBmatcher::SearchForTriangulation 求极线匹配 → 检查视差/重投影误差/正深度/尺度一致
+ *   → 三角化出 3D 点 → 新建 MapPoint 并双向登记观测、算描述子/法向、入待检表。共视基线越大三角化越可靠。
+ */
 void LocalMapping::CreateNewMapPoints()
 {
     // Retrieve neighbor keyframes in covisibility graph
@@ -734,6 +749,10 @@ void LocalMapping::CreateNewMapPoints()
     }    
 }
 
+/**
+ * @brief 把当前 KF 的地图点投影到共视邻居(及其邻居)做融合,反之亦然(消除重复点)
+ * @details 取一、二级共视邻居,双向 ORBmatcher::Fuse;融合后更新本帧地图点描述子/法向 + UpdateConnections。
+ */
 void LocalMapping::SearchInNeighbors()
 {
     // Retrieve neighbor keyframes
@@ -922,6 +941,12 @@ void LocalMapping::InterruptBA()
     mbAbortBA = true;
 }
 
+/**
+ * @brief 剔除冗余关键帧(其 90% 地图点已被其它 ≥3 个 KF 在同等或更细尺度观测)
+ * @details 遍历当前 KF 的共视帧,若某帧绝大多数地图点都被别的 KF 充分观测,则 SetBadFlag 删之。
+ *   ★这是 ORB 控制关键帧数量、保持优化规模有界的手段——对照 VINS 滑窗边缘化:ORB"冗余即删(信息已在别处)"
+ *   vs VINS"边缘化转先验",二者都不真丢信息但代价结构不同(见 docs/slam-overview/VINS-ORBSLAM3-Accuracy-Gap-Attribution.md §4)。
+ */
 void LocalMapping::KeyFrameCulling()
 {
     // Check redundant keyframes (only local keyframes)
@@ -1193,6 +1218,12 @@ bool LocalMapping::isFinished()
     return mbFinished;
 }
 
+/**
+ * @brief 视觉-惯性初始化:估计重力方向、尺度、IMU bias,把纯视觉地图提升为惯性地图
+ * @details 用已有视觉 KF 位姿 + IMU 预积分构惯性优化(InertialOptimization)解出 Rwg(重力方向)/尺度 s/bias;
+ *   再 ApplyScaledRotation 把地图对齐到米制重力世界系;bFIBA 时跟一次全惯性 BA 精化。priorG/priorA 为 bias 先验权重。
+ *   ★三阶段渐进(对应 Map 的 mbIMU_BA1/BA2):越往后先验越松、越信任数据(对照 VINS 的 visualInitialAlign)。
+ */
 void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
 {
     if (mbResetRequested)
@@ -1449,6 +1480,10 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
     return;
 }
 
+/**
+ * @brief 纯尺度 + 重力精化(IMU 初始化后期):只优化尺度 s 与重力方向,不动其余状态
+ * @details 轻量惯性优化,快速修正尺度漂移;解出后 ApplyScaledRotation 应用到整张地图。
+ */
 void LocalMapping::ScaleRefinement()
 {
     // Minimum number of keyframes to compute a solution
