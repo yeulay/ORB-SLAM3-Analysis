@@ -344,6 +344,11 @@ bool LoopClosing::CheckNewKeyFrames()
     return(!mlpLoopKeyFrameQueue.empty());
 }
 
+/**
+ * @brief 检测"公共区域":既找同地图回环,也找跨地图(当前活动地图↔Atlas 其它地图)重叠——ORB-SLAM3 统一的回环+合并检测入口
+ * @details 用 KeyFrameDatabase 词袋检索候选 → DetectCommonRegionsFromBoW 几何验证 + Sim3 求解 + 时序一致性(连续多帧命中才确认)。
+ *   命中同地图 → 置回环标志走 CorrectLoop;命中他地图 → 置合并标志走 MergeLocal/MergeLocal2。是 LoopClosing 主循环的检测核心。
+ */
 bool LoopClosing::NewDetectCommonRegions()
 {
     // To deactivate placerecognition. No loopclosing nor merging will be performed
@@ -1847,6 +1852,11 @@ void LoopClosing::MergeLocal()
 }
 
 
+/**
+ * @brief 惯性(VI)模式的地图合并(MergeLocal 的 IMU 版,焊接窗口更小 numTemporalKFs=11)
+ * @details 与 MergeLocal 同思路(把当前地图焊接进目标地图 + 局部/本质图优化),但额外处理 IMU 状态
+ *   (速度/bias/重力方向)的跨地图合并。详见 docs ORB-SLAM3-Comprehensive-Synthesis §7 MergeLocal vs MergeLocal2。
+ */
 void LoopClosing::MergeLocal2()
 {
     //cout << "Merge detected!!!!" << endl;
@@ -2179,6 +2189,7 @@ void LoopClosing::CheckObservations(set<KeyFrame*> &spKFsMap1, set<KeyFrame*> &s
 }
 
 
+/// @brief 把校正后的回环侧地图点按修正位姿投影到当前侧各 KF 并融合重复点(ORBmatcher::Fuse;回环修正的收尾)
 void LoopClosing::SearchAndFuse(const KeyFrameAndPose &CorrectedPosesMap, vector<MapPoint*> &vpMapPoints)
 {
     ORBmatcher matcher(0.8);
@@ -2332,6 +2343,11 @@ void LoopClosing::ResetIfRequested()
     }
 }
 
+/**
+ * @brief 回环修正后在子线程跑全局 BA(GBA),联合优化全图关键帧位姿与地图点,再传播到 GBA 期间新增的 KF
+ * @details Optimizer::GlobalBundleAdjustment 优化全图 → 用生成树把未参与 GBA 的新 KF 也校正过来 → 更新地图点。
+ *   ★用 mnFullBAIdx 版本号检测 GBA 期间是否又发生新回环,若是则丢弃本次结果(避免用过时优化覆盖新状态)。
+ */
 void LoopClosing::RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoopKF)
 {  
     Verbose::PrintMess("Starting Global Bundle Adjustment", Verbose::VERBOSITY_NORMAL);
