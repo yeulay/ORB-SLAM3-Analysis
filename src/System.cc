@@ -33,6 +33,30 @@
 #include <boost/archive/xml_iarchive.hpp>
 #include <boost/archive/xml_oarchive.hpp>
 
+/* ===================== 全局视角：System 是 ORB-SLAM3 的总入口与三线程拉起点 =====================
+ *
+ * 【系统定位】System 构造函数(下方 System::System)是整个 ORB-SLAM3 的启动点——一次性创建
+ *   Atlas 多地图、词袋库、三大功能线程，是理解 ORB-SLAM3 架构的入口：
+ *
+ *     图像/IMU ─▶ TrackStereo/RGBD/Monocular(主线程) ─▶ [Tracking] ─新KF─▶ [LocalMapping] ─▶ [LoopClosing]
+ *                                                        位姿估计       局部BA/KF管理      回环+Sim3+全局BA
+ *
+ * 【三/四线程架构】(构造函数内拉起，共享 Atlas/Map 对象 + mutex 同步)
+ *   · Tracking：★不另起线程，跑在调用 TrackXXX 的主线程里(前端位姿估计)
+ *   · LocalMapping：new thread(LocalMapping::Run) 局部建图线程
+ *   · LoopClosing：new thread(LoopClosing::Run) 回环检测线程
+ *   · Viewer：可选 new thread(Viewer::Run) 可视化线程
+ *
+ * 【★Atlas 多地图 = ORB-SLAM3 核心创新】(对照 ORB-SLAM2 单地图)
+ *   跟踪丢失时不清空重启，而是冻结当前子地图、新建活跃子地图继续(CreateMapInAtlas)；
+ *   回环/地图合并时再把子地图焊接回来——"多段会话拼一张地图"的能力源头。
+ *
+ * 【与 VINS 的架构对照】(详见 docs/slam-overview/VINS-ORBSLAM3-Architecture-Comparison.md)
+ *   · ORB-SLAM3：★单进程多线程，三线程共享 Atlas/Map 对象，靠 mutex(mMutexNewKFs 等)同步
+ *   · VINS-Mono：三独立进程，靠 ROS topic 通信、无共享内存
+ *   · 失败恢复：ORB 多地图冻存(不丢历史) vs VINS clearState 单地图重启(丢历史)
+ * ======================================================================================== */
+
 namespace ORB_SLAM3
 {
 
